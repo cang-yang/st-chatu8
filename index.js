@@ -17,6 +17,7 @@
  * ====================================================
  */
 import { extension_settings } from "../../../extensions.js";
+import * as __chatu8PerfScriptModule from "../../../../script.js";
 import { saveSettingsDebounced } from "../../../../script.js";
 import { extension_settings as extension_settings2 } from "../../../extensions.js";
 import { saveSettingsDebounced as saveSettingsDebounced2 } from "../../../../script.js";
@@ -3254,6 +3255,35 @@ var init_config = __esm({
   }
 });
 
+// [T02/perf] 原生 base64 能力探测：只读取一次 window.__chatu8perf（默认启用，nativeBase64:false 可整体回退旧逐字节实现）
+function __chatu8PerfNativeBase64() {
+  if (!window.__chatu8perfState || typeof window.__chatu8perfState !== "object") {
+    window.__chatu8perfState = {};
+  }
+  if (typeof window.__chatu8perfState.nativeBase64 !== "boolean") {
+    let enabled = true;
+    try {
+      const perfConfig = window.__chatu8perf;
+      if (perfConfig && perfConfig.nativeBase64 === false) enabled = false;
+    } catch (configError) {
+      enabled = true;
+    }
+    window.__chatu8perfState.nativeBase64 = enabled;
+  }
+  return window.__chatu8perfState.nativeBase64;
+}
+// [T02/perf] 分块 base64：与旧的逐字节拼串输出完全一致（String.fromCharCode.apply 每块 8KB）
+function __chatu8PerfChunkedBase64(uint8Array) {
+  let binary = "";
+  const len = uint8Array.byteLength;
+  const chunkSize = 8192;
+  for (let i = 0; i < len; i += chunkSize) {
+    const end = i + chunkSize < len ? i + chunkSize : len;
+    binary += String.fromCharCode.apply(null, uint8Array.subarray(i, end));
+  }
+  return window.btoa(binary);
+}
+
 // utils/steganography.js
 var ImageSteganography;
 var init_steganography = __esm({
@@ -3270,7 +3300,7 @@ var init_steganography = __esm({
       async encode(jsonData) {
         try {
           const jsonStr = JSON.stringify(jsonData);
-          const base64Data = this.stringToBase64(jsonStr);
+          const base64Data = __chatu8PerfNativeBase64() ? await this.stringToBase64Async(jsonStr) : this.stringToBase64(jsonStr);
           const result = this.MIME_TYPE + base64Data;
           return result;
         } catch (error) {
@@ -3313,6 +3343,36 @@ var init_steganography = __esm({
         return this.uint8ArrayToBase64(uint8Array);
       }
       /**
+       * 字符串转 Base64（异步快速路径）：优先原生 Uint8Array.toBase64，其次 Blob + FileReader，
+       * 均不可用时回退同步分块实现。三条路径的输出与旧逐字节实现逐字节一致。
+       * @param {string} str
+       * @returns {Promise<string>}
+       */
+      async stringToBase64Async(str) {
+        const uint8Array = new TextEncoder().encode(str);
+        if (typeof uint8Array.toBase64 === "function") {
+          return uint8Array.toBase64();
+        }
+        if (typeof Blob === "function" && typeof FileReader === "function") {
+          try {
+            const dataUrl = await new Promise((resolve, reject) => {
+              const reader = new FileReader();
+              reader.onloadend = () => {
+                if (typeof reader.result === "string") resolve(reader.result);
+                else reject(new Error("FileReader result is not a string"));
+              };
+              reader.onerror = () => reject(reader.error || new Error("FileReader error"));
+              reader.readAsDataURL(new Blob([uint8Array]));
+            });
+            const commaIndex = dataUrl.indexOf(",");
+            return commaIndex === -1 ? dataUrl : dataUrl.substring(commaIndex + 1);
+          } catch (readerError) {
+            console.warn("[Stego] \u539F\u751F base64 \u7F16\u7801\u5931\u8D25\uFF0C\u56DE\u9000\u540C\u6B65\u5B9E\u73B0:", readerError && readerError.message);
+          }
+        }
+        return this.uint8ArrayToBase64(uint8Array);
+      }
+      /**
        * Base64 转字符串
        * @param {string} base64 
        * @returns {string}
@@ -3328,6 +3388,12 @@ var init_steganography = __esm({
        * @returns {string}
        */
       uint8ArrayToBase64(uint8Array) {
+        if (__chatu8PerfNativeBase64()) {
+          if (typeof uint8Array.toBase64 === "function") {
+            return uint8Array.toBase64();
+          }
+          return __chatu8PerfChunkedBase64(uint8Array);
+        }
         let binary = "";
         const len = uint8Array.byteLength;
         for (let i = 0; i < len; i++) {
@@ -3341,6 +3407,12 @@ var init_steganography = __esm({
        * @returns {Uint8Array}
        */
       base64ToUint8Array(base64) {
+        if (__chatu8PerfNativeBase64() && typeof Uint8Array.fromBase64 === "function") {
+          try {
+            return Uint8Array.fromBase64(base64);
+          } catch (nativeDecodeError) {
+          }
+        }
         const binaryString = window.atob(base64);
         const len = binaryString.length;
         const bytes = new Uint8Array(len);
@@ -3370,6 +3442,12 @@ var init_steganography = __esm({
 
 
 function base64ToArrayBuffer(base64) {
+  if (__chatu8PerfNativeBase64() && typeof Uint8Array.fromBase64 === "function") {
+    try {
+      return Uint8Array.fromBase64(base64).buffer;
+    } catch (nativeDecodeError) {
+    }
+  }
   const binaryString = window.atob(base64);
   const len = binaryString.length;
   const bytes = new Uint8Array(len);
@@ -3387,8 +3465,14 @@ function base64ByteLength(base64) {
   return Math.floor(len * 3 / 4) - padding;
 }
 function arrayBufferToBase64(buffer) {
-  let binary = "";
   const bytes = new Uint8Array(buffer);
+  if (__chatu8PerfNativeBase64()) {
+    if (typeof bytes.toBase64 === "function") {
+      return bytes.toBase64();
+    }
+    return __chatu8PerfChunkedBase64(bytes);
+  }
+  let binary = "";
   const len = bytes.byteLength;
   for (let i = 0; i < len; i++) {
     binary += String.fromCharCode(bytes[i]);
@@ -3476,7 +3560,7 @@ async function syncIndexToStorage(md5, globalIndex, sortedImages, skipStego = fa
   if (storage && storage[md5]) {
     if (storage[md5].index !== correctedIndex) {
       storage[md5].index = correctedIndex;
-      saveSettingsDebounced();
+      __chatu8PerfScheduleSettingsSave("index");
       jiuguanStorageModified = true;
     }
   }
@@ -4023,13 +4107,409 @@ async function getItemImg(tag, index = null) {
   }
   return [false, false, false, false, "", "", ""];
 }
+// ===== __chatu8perf T01: 把生图收尾重活移出“图片显示”路径 =====
+// 回退开关: window.__chatu8perf = { tailOffMainThread: false }（只读取一次）
+// 行为: 图片先显示；图片上传 / 缩略图 / 索引写入 / 保存设置 / 隐写索引重编码
+//       进入后台串行队列，每步之间让出主线程；pagehide 前同步启动未完成任务(flush)。
+var chatu8TailState = null;
+var chatu8TailSwitch = null;
+function chatu8TailEnabled() {
+  if (chatu8TailSwitch !== null) return chatu8TailSwitch;
+  var enabled = true;
+  try {
+    var perfCfg = window.__chatu8perf;
+    if (perfCfg && perfCfg.tailOffMainThread === false) enabled = false;
+  } catch (e) {
+  }
+  chatu8TailSwitch = enabled;
+  return enabled;
+}
+function chatu8TailShouldYield(options) {
+  if (!options || options.__tailRun !== true) return false;
+  if (chatu8TailState && chatu8TailState.flushing) return false;
+  return true;
+}
+async function chatu8TailStep(options) {
+  if (!options || options.__tailRun !== true) return;
+  const stepJob = options.__tailJob;
+  if (stepJob && stepJob.canceled) throw new Error("收尾任务已取消");
+  if (chatu8TailState && chatu8TailState.flushing) return;
+  await chatu8TailYield();
+}
+function chatu8TailYield() {
+  if (chatu8TailState && chatu8TailState.flushing) return Promise.resolve();
+  try {
+    if (window.scheduler && typeof window.scheduler.yield === "function") {
+      return window.scheduler.yield();
+    }
+  } catch (e) {
+  }
+  return new Promise(function(resolve) {
+    setTimeout(resolve, 0);
+  });
+}
+function chatu8TailTick() {
+  return new Promise(function(resolve) {
+    try {
+      if (typeof MessageChannel === "function") {
+        var channel = new MessageChannel();
+        channel.port1.onmessage = function() {
+          channel.port1.close();
+          resolve();
+        };
+        channel.port2.postMessage(0);
+        return;
+      }
+    } catch (e) {
+    }
+    setTimeout(resolve, 0);
+  });
+}
+function chatu8TailGetState() {
+  if (chatu8TailState) return chatu8TailState;
+  var state = {
+    jobs: [],
+    seq: 0,
+    running: false,
+    scheduled: false,
+    paused: false,
+    flushing: false,
+    current: null,
+    completed: 0,
+    failed: 0,
+    canceled: 0
+  };
+  chatu8TailState = state;
+  try {
+    window.addEventListener("pagehide", chatu8TailFlushForUnload, true);
+    window.addEventListener("beforeunload", chatu8TailFlushForUnload);
+  } catch (e) {
+  }
+  try {
+    window.__chatu8perfState = window.__chatu8perfState || {};
+    window.__chatu8perfState.tail = {
+      pending: function() {
+        return chatu8TailState ? chatu8TailState.jobs.length : 0;
+      },
+      stats: function() {
+        if (!chatu8TailState) return null;
+        return {
+          pending: chatu8TailState.jobs.length,
+          running: chatu8TailState.running,
+          completed: chatu8TailState.completed,
+          failed: chatu8TailState.failed,
+          canceled: chatu8TailState.canceled
+        };
+      },
+      idle: function() {
+        return !(chatu8TailState && (chatu8TailState.running || chatu8TailState.jobs.length > 0));
+      },
+      flush: function() {
+        return chatu8TailRun();
+      },
+      pause: function() {
+        if (chatu8TailState) chatu8TailState.paused = true;
+      },
+      resume: function() {
+        if (chatu8TailState) {
+          chatu8TailState.paused = false;
+          chatu8TailKick();
+        }
+      },
+      cancel: function(id) {
+        return chatu8TailCancel(id);
+      },
+      cancelAll: function() {
+        return chatu8TailCancel(null);
+      }
+    };
+  } catch (e) {
+  }
+  return state;
+}
+function chatu8TailCancel(id) {
+  var state = chatu8TailGetState();
+  var count = 0;
+  var cancelAll = id === null || id === void 0;
+  for (var i = state.jobs.length - 1; i >= 0; i--) {
+    if (cancelAll || state.jobs[i].id === id) {
+      state.jobs[i].canceled = true;
+      state.jobs.splice(i, 1);
+      state.canceled++;
+      count++;
+    }
+  }
+  if (state.current && (cancelAll || state.current.id === id)) {
+    state.current.canceled = true;
+    try {
+      if (state.current.controller) state.current.controller.abort();
+    } catch (e) {
+    }
+    count++;
+  }
+  return count;
+}
+function chatu8TailKick() {
+  var state = chatu8TailGetState();
+  if (state.running || state.scheduled || state.paused || state.jobs.length === 0 || state.flushing) return;
+  state.scheduled = true;
+  setTimeout(function() {
+    state.scheduled = false;
+    chatu8TailRun();
+  }, 0);
+}
+function chatu8TailNotify(job, error) {
+  if (!error) {
+    try {
+      if (typeof job.onSuccess === "function") job.onSuccess();
+    } catch (e) {
+      console.error("[chatu8 perf] 收尾成功回调执行失败:", e);
+    }
+    return;
+  }
+  var delivered = false;
+  if (typeof job.onError === "function") {
+    try {
+      job.onError(error);
+      delivered = true;
+    } catch (e) {
+      console.error("[chatu8 perf] 收尾失败回调执行失败:", e);
+    }
+  }
+  try {
+    if (window.__chatu8perfState && window.__chatu8perfState.tail) {
+      window.__chatu8perfState.tail.lastError = {
+        name: job.name || "",
+        message: error && error.message ? error.message : String(error),
+        at: Date.now()
+      };
+    }
+  } catch (e) {
+  }
+  if (!delivered) {
+    try {
+      if (window.toastr && typeof window.toastr.error === "function") {
+        window.toastr.error("图片已显示，但保存到数据库失败，详见控制台日志。");
+      }
+    } catch (e) {
+    }
+  }
+}
+function chatu8TailScheduleSave() {
+  try {
+    if (typeof __chatu8PerfScheduleSettingsSave === "function") {
+      __chatu8PerfScheduleSettingsSave("index");
+      return true;
+    }
+  } catch (e) {
+  }
+  try {
+    saveSettingsDebounced();
+  } catch (e) {
+  }
+  return false;
+}
+function chatu8TailFlushSettings() {
+  try {
+    var perfState = window.__chatu8perfState;
+    var settingsApi = perfState && perfState.settings;
+    var flush = settingsApi && settingsApi.flush;
+    if (typeof flush !== "function") return false;
+    var result = flush();
+    if (result && typeof result.catch === "function") result.catch(function() {
+    });
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+async function chatu8TailRun() {
+  var state = chatu8TailGetState();
+  if (state.running) return;
+  state.running = true;
+  try {
+    while (state.jobs.length > 0) {
+      if (state.paused && !state.flushing) break;
+      var job = state.jobs.shift();
+      if (job.canceled) continue;
+      state.current = job;
+      try {
+        await job.run(job);
+        state.completed++;
+        chatu8TailNotify(job, null);
+      } catch (error) {
+        if (job.canceled) {
+          state.canceled++;
+        } else {
+          state.failed++;
+          console.error("[chatu8 perf] 收尾后台任务失败:", job.name || "", error);
+          chatu8TailNotify(job, error);
+        }
+      }
+      state.current = null;
+      await chatu8TailTick();
+    }
+  } finally {
+    state.running = false;
+  }
+  if (state.jobs.length > 0 && !state.paused) chatu8TailKick();
+}
+function chatu8TailFlushForUnload() {
+  var state = chatu8TailGetState();
+  state.flushing = true;
+  state.paused = false;
+  if (!state.running && state.jobs.length > 0) {
+    try {
+      var drained = chatu8TailRun();
+      if (drained && typeof drained.catch === "function") drained.catch(function() {
+      });
+    } catch (e) {
+    }
+    return;
+  }
+  while (state.jobs.length > 0) {
+    var job = state.jobs.shift();
+    if (job.canceled) continue;
+    try {
+      var pending = job.run(job);
+      if (pending && typeof pending.then === "function") {
+        pending.then(function() {
+          chatu8TailNotify(job, null);
+        }, function(err) {
+          chatu8TailNotify(job, err);
+        });
+      }
+    } catch (e) {
+      chatu8TailNotify(job, e);
+    }
+  }
+}
+function chatu8TailEnqueue(name, run, hooks) {
+  var state = chatu8TailGetState();
+  var controller = null;
+  try {
+    if (typeof AbortController === "function") controller = new AbortController();
+  } catch (e) {
+  }
+  var job = {
+    id: ++state.seq,
+    name,
+    run,
+    canceled: false,
+    controller,
+    signal: controller ? controller.signal : null,
+    onSuccess: hooks && typeof hooks.onSuccess === "function" ? hooks.onSuccess : null,
+    onError: hooks && typeof hooks.onError === "function" ? hooks.onError : null
+  };
+  state.jobs.push(job);
+  if (state.flushing) {
+    try {
+      var started = job.run(job);
+      if (started && typeof started.then === "function") {
+        started.then(function() {
+          chatu8TailNotify(job, null);
+        }, function(err) {
+          chatu8TailNotify(job, err);
+        });
+      }
+    } catch (e) {
+      chatu8TailNotify(job, e);
+    }
+    return job.id;
+  }
+  if (state.paused) return job.id;
+  chatu8TailKick();
+  return job.id;
+}
 async function setItemImg(tag, imgBase64, options = { format: "png" }) {
+  if (chatu8TailEnabled() && options && options.__tailRun !== true) {
+    const carry = { hasTail: false, imagePath: null };
+    const frontPath = await setItemImg(tag, imgBase64, Object.assign({}, options, { __tailRun: true, __tailPhase: "front", __tailCarry: carry }));
+    if (!carry.hasTail) return frontPath;
+    const jobId = chatu8TailEnqueue("setItemImg:tail", function(tailJob) {
+      return setItemImg(tag, imgBase64, Object.assign({}, options, {
+        __tailRun: true,
+        __tailPhase: "tail",
+        __tailCarry: carry,
+        __tailJob: tailJob,
+        __tailSignal: tailJob ? tailJob.signal : null
+      }));
+    }, {
+      onSuccess: typeof options.onTailSuccess === "function" ? options.onTailSuccess : null,
+      onError: typeof options.onTailError === "function" ? options.onTailError : null
+    });
+    return { queued: true, jobId: jobId, imagePath: frontPath };
+  }
   const { change = "", video = "", activeMode = "", characterName = "chatu8", filename, format, isVideo = false, originalUrl = "", genParams = null } = options;
   if (extension_settings[extensionName].jiuguanchucun === "true") {
+    if (options.__tailPhase === "tail") {
+      const tailCarry = options.__tailCarry || {};
+      const tailMd5 = tailCarry.md5;
+      let thumbnailPath = null;
+      let thumbnailSize = 0;
+      try {
+        await chatu8TailStep(options);
+        let thumbnailBlob;
+        if (isVideo) {
+          thumbnailBlob = await createThumbnailFromVideo(imgBase64);
+        } else {
+          thumbnailBlob = await createThumbnailFromBuffer(base64ToArrayBuffer(tailCarry.base64Data));
+        }
+        const thumbnailBase64 = await blobToBase64(thumbnailBlob);
+        const thumbnailData = thumbnailBase64.split(",")[1] || thumbnailBase64;
+        const thumbnailUploadBody = {
+          image: thumbnailData,
+          format: "jpeg"
+          // 缩略图使用 JPEG 格式以减小文件大小
+        };
+        if (characterName) {
+          thumbnailUploadBody.ch_name = characterName;
+        }
+        if (filename) {
+          thumbnailUploadBody.filename = `thumb_${filename || tailCarry.uuid}`;
+        }
+        const thumbnailResponse = await fetch("/api/images/upload", {
+          method: "POST",
+          headers: getRequestHeaders(window.token),
+          body: JSON.stringify(thumbnailUploadBody),
+          signal: options.__tailSignal || void 0
+        });
+        if (thumbnailResponse.ok) {
+          const thumbnailResult = await thumbnailResponse.json();
+          thumbnailPath = thumbnailResult.path;
+          thumbnailSize = base64ByteLength(thumbnailData);
+        } else {
+          console.error("Failed to upload thumbnail:", thumbnailResponse.statusText);
+        }
+      } catch (thumbnailError) {
+        console.error("Failed to create or upload thumbnail:", thumbnailError);
+      }
+      await chatu8TailStep(options);
+      if (tailCarry.entry) {
+        tailCarry.entry.thumbnail_path = thumbnailPath;
+        tailCarry.entry.thumbnail_size = thumbnailSize;
+      }
+      chatu8TailScheduleSave();
+      chatu8TailFlushSettings();
+      await chatu8TailStep(options);
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      if (!window.imagesid) window.imagesid = {};
+      window.imagesid[tailMd5] = tailCarry.newDate;
+      try {
+        await updateStegoImage({ throwOnError: true });
+      } catch (stegoError) {
+        const stegoMessage = stegoError && stegoError.message ? stegoError.message : String(stegoError);
+        const wrapped = new Error("\u9690\u5199\u7D22\u5F15\u5199\u5165\u5931\u8D25\uFF08\u56FE\u7247\u4E0E\u7D22\u5F15\u672C\u8EAB\u5DF2\u4FDD\u5B58\uFF09: " + stegoMessage);
+        wrapped.__chatu8TailFailureKind = "stego";
+        throw wrapped;
+      }
+      return tailCarry.imagePath;
+    }
     const md5 = CryptoJS.MD5(tag).toString();
     const uuid = generateUUID();
     const thumbnailUUID = generateUUID();
     const newDate = (/* @__PURE__ */ new Date()).getTime();
+    await chatu8TailStep(options);
     const base64Data = imgBase64.split(",")[1] || imgBase64;
     let uploadFormat = "png";
     if (isVideo) {
@@ -4058,7 +4538,8 @@ async function setItemImg(tag, imgBase64, options = { format: "png" }) {
       const response = await fetch("/api/images/upload", {
         method: "POST",
         headers: getRequestHeaders(window.token),
-        body: JSON.stringify(uploadBody)
+        body: JSON.stringify(uploadBody),
+        signal: options.__tailSignal || void 0
       });
       if (!response.ok) {
         throw new Error(`Upload failed: ${response.statusText}`);
@@ -4067,7 +4548,9 @@ async function setItemImg(tag, imgBase64, options = { format: "png" }) {
       const imagePath = result.path;
       let thumbnailPath = null;
       let thumbnailSize = 0;
+      if (options.__tailPhase !== "front") {
       try {
+        await chatu8TailStep(options);
         let thumbnailBlob;
         if (isVideo) {
           thumbnailBlob = await createThumbnailFromVideo(imgBase64);
@@ -4091,7 +4574,8 @@ async function setItemImg(tag, imgBase64, options = { format: "png" }) {
         const thumbnailResponse = await fetch("/api/images/upload", {
           method: "POST",
           headers: getRequestHeaders(window.token),
-          body: JSON.stringify(thumbnailUploadBody)
+          body: JSON.stringify(thumbnailUploadBody),
+          signal: options.__tailSignal || void 0
         });
         if (thumbnailResponse.ok) {
           const thumbnailResult = await thumbnailResponse.json();
@@ -4102,6 +4586,7 @@ async function setItemImg(tag, imgBase64, options = { format: "png" }) {
         }
       } catch (thumbnailError) {
         console.error("Failed to create or upload thumbnail:", thumbnailError);
+      }
       }
       if (!extension_settings[extensionName].jiuguanStorage) {
         extension_settings[extensionName].jiuguanStorage = {};
@@ -4136,16 +4621,37 @@ async function setItemImg(tag, imgBase64, options = { format: "png" }) {
           activeMode: activeMode || ""
         };
       }
+      await chatu8TailStep(options);
+      if (options.__tailPhase === "front") {
+        const frontMerged = await getMergedAndSortedImages(md5);
+        let frontIndex = frontMerged.images.findIndex((img) => img.uuid === uuid);
+        if (frontIndex === -1) {
+          frontIndex = frontMerged.images.length > 0 ? frontMerged.images.length - 1 : 0;
+        }
+        await syncIndexToStorage(md5, frontIndex, frontMerged.images, true);
+        if (options.__tailCarry) {
+          options.__tailCarry.hasTail = true;
+          options.__tailCarry.imagePath = imagePath;
+          options.__tailCarry.md5 = md5;
+          options.__tailCarry.uuid = uuid;
+          options.__tailCarry.newDate = newDate;
+          options.__tailCarry.base64Data = base64Data;
+          options.__tailCarry.storage = storage;
+          options.__tailCarry.entry = newImageEntry;
+        }
+        return imagePath;
+      }
       const merged = await getMergedAndSortedImages(md5);
       let newIndex = merged.images.findIndex((img) => img.uuid === uuid);
       if (newIndex === -1) {
         newIndex = merged.images.length > 0 ? merged.images.length - 1 : 0;
       }
       await syncIndexToStorage(md5, newIndex, merged.images, true);
-      saveSettingsDebounced();
+      __chatu8PerfScheduleSettingsSave("index");
       await new Promise((resolve) => setTimeout(resolve, 50));
       if (!window.imagesid) window.imagesid = {};
       window.imagesid[md5] = newDate;
+      await chatu8TailStep(options);
       await updateStegoImage();
       return imagePath;
     } catch (error) {
@@ -4153,13 +4659,44 @@ async function setItemImg(tag, imgBase64, options = { format: "png" }) {
       throw error;
     }
   } else {
+    if (options.__tailPhase === "tail") {
+      const tailCarry = options.__tailCarry || {};
+      const tailMd5 = tailCarry.md5;
+      let tailThumbnailSize = 0;
+      try {
+        await chatu8TailStep(options);
+        let thumbnailBlob;
+        if (isVideo) {
+          thumbnailBlob = await createThumbnailFromVideo(imgBase64);
+        } else {
+          thumbnailBlob = await createThumbnailFromBuffer(base64ToArrayBuffer(tailCarry.base64Data));
+        }
+        const thumbnailBuffer = await thumbnailBlob.arrayBuffer();
+        tailThumbnailSize = thumbnailBuffer.byteLength;
+        await storeReadWrite({ id: tailCarry.thumbnailUUID, data: thumbnailBuffer });
+      } catch (thumbnailError) {
+        console.error("Failed to create or store thumbnail:", thumbnailError);
+      }
+      await chatu8TailStep(options);
+      if (tailCarry.entry) tailCarry.entry.thumbnail_size = tailThumbnailSize;
+      await setMetadata(tailCarry.metadata);
+      if (tailCarry.settingsTouched) {
+        chatu8TailScheduleSave();
+        chatu8TailFlushSettings();
+      }
+      if (!window.imagesid) window.imagesid = {};
+      window.imagesid[tailMd5] = tailCarry.newDate;
+      return "indexeddb_saved";
+    }
     const md5 = CryptoJS.MD5(tag).toString();
     const imageBuffer = base64ToArrayBuffer(imgBase64.split(",")[1] || imgBase64);
     const uuid = generateUUID();
     const newDate = (/* @__PURE__ */ new Date()).getTime();
     const thumbnailUUID = generateUUID();
     let thumbnailSize = 0;
+    if (options.__tailPhase !== "front") {
     try {
+      await chatu8TailStep(options);
       let thumbnailBlob;
       if (isVideo) {
         thumbnailBlob = await createThumbnailFromVideo(imgBase64);
@@ -4171,6 +4708,7 @@ async function setItemImg(tag, imgBase64, options = { format: "png" }) {
       await storeReadWrite({ id: thumbnailUUID, data: thumbnailBuffer });
     } catch (error) {
       console.error("Failed to create or store thumbnail:", error);
+    }
     }
     await storeReadWrite({ id: uuid, data: imageBuffer });
     const metadata = await getMetadata();
@@ -4201,7 +4739,30 @@ async function setItemImg(tag, imgBase64, options = { format: "png" }) {
         activeMode: activeMode || ""
       };
     }
+    await chatu8TailStep(options);
     await setMetadata(metadata);
+    if (options.__tailPhase === "front") {
+      const frontMerged = await getMergedAndSortedImages(md5);
+      let frontIndex = frontMerged.images.findIndex((img) => img.uuid === uuid);
+      if (frontIndex === -1) {
+        frontIndex = frontMerged.images.length > 0 ? frontMerged.images.length - 1 : 0;
+      }
+      const frontSettingsTouched = !!(extension_settings[extensionName].jiuguanStorage && extension_settings[extensionName].jiuguanStorage[md5]);
+      await syncIndexToStorage(md5, frontIndex, frontMerged.images);
+      if (options.__tailCarry) {
+        options.__tailCarry.hasTail = true;
+        options.__tailCarry.imagePath = "indexeddb_saved";
+        options.__tailCarry.md5 = md5;
+        options.__tailCarry.uuid = uuid;
+        options.__tailCarry.thumbnailUUID = thumbnailUUID;
+        options.__tailCarry.newDate = newDate;
+        options.__tailCarry.base64Data = imgBase64.split(",")[1] || imgBase64;
+        options.__tailCarry.metadata = metadata;
+        options.__tailCarry.entry = newImageEntry;
+        options.__tailCarry.settingsTouched = frontSettingsTouched;
+      }
+      return "indexeddb_saved";
+    }
     const merged = await getMergedAndSortedImages(md5);
     let newIndex = merged.images.findIndex((img) => img.uuid === uuid);
     if (newIndex === -1) {
@@ -4361,7 +4922,114 @@ async function storeDelete(id) {
     request.onerror = (event) => reject(event.target.error);
   });
 }
+// [chatu8-perf T03] 图片元数据内存缓存 + 脏标记。
+// 回滚开关：window.__chatu8perf = { metadataCache: false }（首次读取后记忆）
+// 运行期接口：window.__chatu8perfState.metadataCache.{setEnabled,setTtl,invalidate,stats,resetStats}
+var __chatu8T03Cache = null;
+var __chatu8T03Pending = null;
+var __chatu8T03Gen = 0;
+var __chatu8T03EnabledMemo;
+var __chatu8T03TtlMemo;
+var __chatu8T03Stats = { reads: 0, hits: 0, joins: 0, misses: 0, parses: 0, writes: 0, invalidations: 0, lastReason: "" };
+function __chatu8T03Perf() {
+  const cfg = window.__chatu8perf;
+  return cfg && typeof cfg === "object" ? cfg : null;
+}
+function __chatu8T03Enabled() {
+  if (__chatu8T03EnabledMemo === void 0) {
+    const cfg = __chatu8T03Perf();
+    __chatu8T03EnabledMemo = !(cfg && cfg.metadataCache === false);
+  }
+  return __chatu8T03EnabledMemo;
+}
+function __chatu8T03Ttl() {
+  if (__chatu8T03TtlMemo === void 0) {
+    const cfg = __chatu8T03Perf();
+    const ttl = cfg && cfg.metadataCacheTtlMs;
+    __chatu8T03TtlMemo = typeof ttl === "number" && ttl >= 0 ? ttl : 4e3;
+  }
+  return __chatu8T03TtlMemo;
+}
+function __chatu8T03Invalidate(reason) {
+  __chatu8T03Gen++;
+  __chatu8T03Cache = null;
+  __chatu8T03Stats.invalidations++;
+  __chatu8T03Stats.lastReason = reason || "";
+}
+function __chatu8T03SetEnabled(enabled) {
+  __chatu8T03EnabledMemo = !!enabled;
+  __chatu8T03Invalidate("setEnabled");
+  return __chatu8T03EnabledMemo;
+}
+function __chatu8T03SetTtl(ms) {
+  __chatu8T03TtlMemo = typeof ms === "number" && ms >= 0 ? ms : void 0;
+  return __chatu8T03Ttl();
+}
+function __chatu8T03ResetStats() {
+  __chatu8T03Stats = { reads: 0, hits: 0, joins: 0, misses: 0, parses: 0, writes: 0, invalidations: 0, lastReason: "" };
+}
+(function() {
+  if (!window.__chatu8perfState) window.__chatu8perfState = {};
+  window.__chatu8perfState.metadataCache = {
+    get enabled() {
+      return __chatu8T03Enabled();
+    },
+    setEnabled: __chatu8T03SetEnabled,
+    setTtl: __chatu8T03SetTtl,
+    invalidate: __chatu8T03Invalidate,
+    resetStats: __chatu8T03ResetStats,
+    stats: () => ({
+      ...__chatu8T03Stats,
+      gen: __chatu8T03Gen,
+      cached: !!__chatu8T03Cache,
+      pending: !!__chatu8T03Pending,
+      cacheGen: __chatu8T03Cache ? __chatu8T03Cache.gen : null,
+      ttlMs: __chatu8T03Ttl()
+    })
+  };
+})();
+async function __chatu8T03LoadMetadata() {
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const genAtStart = __chatu8T03Gen;
+    const data = await storeReadOnly(metadataId);
+    if (!data || !data.shuju) return {};
+    let parsed;
+    try {
+      parsed = JSON.parse(data.shuju);
+    } catch (e) {
+      console.error("Failed to parse image metadata:", e);
+      __chatu8T03Invalidate("parse-error");
+      return {};
+    }
+    __chatu8T03Stats.parses++;
+    if (genAtStart === __chatu8T03Gen) {
+      __chatu8T03Cache = { data: parsed, gen: __chatu8T03Gen, ts: Date.now() };
+      return parsed;
+    }
+    if (attempt === 1) return parsed;
+  }
+  return {};
+}
 async function getMetadata() {
+  if (__chatu8T03Enabled()) {
+    const cached = __chatu8T03Cache;
+    __chatu8T03Stats.reads++;
+    if (cached && cached.gen === __chatu8T03Gen && Date.now() - cached.ts <= __chatu8T03Ttl()) {
+      __chatu8T03Stats.hits++;
+      return cached.data;
+    }
+    if (__chatu8T03Pending) {
+      __chatu8T03Stats.joins++;
+      return __chatu8T03Pending;
+    }
+    __chatu8T03Stats.misses++;
+    __chatu8T03Pending = __chatu8T03LoadMetadata();
+    try {
+      return await __chatu8T03Pending;
+    } finally {
+      __chatu8T03Pending = null;
+    }
+  }
   const data = await storeReadOnly(metadataId);
   if (data && data.shuju) {
     try {
@@ -4373,7 +5041,17 @@ async function getMetadata() {
   return {};
 }
 async function setMetadata(metadata) {
-  await storeReadWrite({ id: metadataId, shuju: JSON.stringify(metadata) });
+  try {
+    await storeReadWrite({ id: metadataId, shuju: JSON.stringify(metadata) });
+  } catch (e) {
+    if (__chatu8T03Enabled()) __chatu8T03Invalidate("write-failed");
+    throw e;
+  }
+  if (__chatu8T03Enabled()) {
+    __chatu8T03Stats.writes++;
+    __chatu8T03Gen++;
+    __chatu8T03Cache = { data: metadata, gen: __chatu8T03Gen, ts: Date.now() };
+  }
 }
 async function generateMissingThumbnails() {
   console.log("Checking for missing thumbnails...");
@@ -6032,11 +6710,11 @@ async function initJiuguanStorage() {
   const stego = new ImageSteganography();
   try {
     console.log("[Stego] \u5F00\u59CB\u521D\u59CB\u5316 jiuguanStorage...");
-    const imageBase64 = await fetchStegoImage();
-    if (imageBase64) {
+    const imagePayload = await fetchStegoImage();
+    if (imagePayload) {
       console.log("[Stego] \u627E\u5230\u9690\u5199\u56FE\u7247\uFF0C\u5F00\u59CB\u89E3\u7801...");
       try {
-        const data = await stego.decode(imageBase64);
+        const data = await decodeStegoPayload(imagePayload);
         if (!extension_settings[extensionName].jiuguanStorage) {
           extension_settings[extensionName].jiuguanStorage = {};
         }
@@ -6089,11 +6767,16 @@ async function initJiuguanStorage() {
 }
 function arrayBufferToBase64DataURL(buffer) {
   const bytes = new Uint8Array(buffer);
-  let binary = "";
-  for (let i = 0; i < bytes.byteLength; i++) {
-    binary += String.fromCharCode(bytes[i]);
+  let base64;
+  if (__chatu8PerfNativeBase64()) {
+    base64 = typeof bytes.toBase64 === "function" ? bytes.toBase64() : __chatu8PerfChunkedBase64(bytes);
+  } else {
+    let binary = "";
+    for (let i = 0; i < bytes.byteLength; i++) {
+      binary += String.fromCharCode(bytes[i]);
+    }
+    base64 = window.btoa(binary);
   }
-  const base64 = window.btoa(binary);
   return `data:image/png;base64,${base64}`;
 }
 async function fetchStegoImage() {
@@ -6104,6 +6787,9 @@ async function fetchStegoImage() {
       headers: getRequestHeaders(window.token)
     });
     if (response.ok) {
+      if (__chatu8PerfNativeBase64()) {
+        return await response.text();
+      }
       const arrayBuffer = await response.arrayBuffer();
       return arrayBufferToBase64DataURL(arrayBuffer);
     }
@@ -6112,6 +6798,16 @@ async function fetchStegoImage() {
     console.error("[Stego] \u83B7\u53D6\u56FE\u7247\u5931\u8D25:", error);
     return null;
   }
+}
+async function decodeStegoPayload(payload) {
+  if (__chatu8PerfNativeBase64()) {
+    try {
+      return JSON.parse(payload);
+    } catch (jsonError) {
+      console.warn("[Stego] \u76F4\u8BFB JSON \u5931\u8D25\uFF0C\u56DE\u9000\u65E7 base64 \u89E3\u7801\u8DEF\u5F84:", jsonError && jsonError.message);
+    }
+  }
+  return await new ImageSteganography().decode(payload);
 }
 async function createStegoImage() {
   const stego = new ImageSteganography();
@@ -6125,7 +6821,7 @@ async function createStegoImage() {
     throw error;
   }
 }
-async function updateStegoImage() {
+async function updateStegoImage(options) {
   const stego = new ImageSteganography();
   try {
     const currentData = extension_settings[extensionName].jiuguanStorage || {};
@@ -6136,6 +6832,7 @@ async function updateStegoImage() {
     console.log("[Stego] \u9690\u5199\u56FE\u7247\u66F4\u65B0\u6210\u529F");
   } catch (error) {
     console.error("[Stego] \u66F4\u65B0\u9690\u5199\u56FE\u7247\u5931\u8D25:", error);
+    if (options && options.throwOnError) throw error;
   }
 }
 async function uploadStegoImage(imageBase64) {
@@ -6872,6 +7569,153 @@ async function deleteKnowledgeBaseContent(baseId) {
 function generateChatImageId() {
   return `chatimg_${generateUUID2()}`;
 }
+// ===== chatu8-perf T05: merged full-settings save (rollback: window.__chatu8perf = { settingsSaveMerge: false }) =====
+// Every write that used to fire saveSettingsDebounced() immediately now goes through one
+// shared coalescer: registry-only writes (log sessions / JSON blobs) merely mark the shared
+// settings object dirty and are persisted by the next image-index save, by any other
+// full-settings save, or by the lifecycle flush, so one image-generation window performs at
+// most one full settings serialisation + POST.
+var __chatu8PerfSaveMergeEnabled = (() => {
+  try {
+    return !(typeof window !== "undefined" && window.__chatu8perf && window.__chatu8perf.settingsSaveMerge === false);
+  } catch (_) {
+    return true;
+  }
+})();
+var __chatu8PerfSaveConfirmMs = (() => {
+  try {
+    const v = typeof window !== "undefined" && window.__chatu8perf ? window.__chatu8perf.settingsSaveConfirmMs : void 0;
+    return typeof v === "number" && Number.isFinite(v) && v >= 5e3 ? v : 45e3;
+  } catch (_) {
+    return 45e3;
+  }
+})();
+var __chatu8PerfSaveMaxRetries = 2;
+var __chatu8PerfSaveDirty = false;
+var __chatu8PerfSaveUnconfirmed = false;
+var __chatu8PerfSaveRetries = 0;
+var __chatu8PerfSaveRetryTimer = null;
+var __chatu8PerfSaveConfirmationReady = false;
+var __chatu8PerfSaveStats = { requests: 0, coalesced: 0, flushes: 0, flushReasons: {}, retries: 0, confirmations: 0, lastFlushAt: 0, lastFlushReason: "" };
+function __chatu8PerfSaveNote(reason) {
+  __chatu8PerfSaveStats.flushes++;
+  __chatu8PerfSaveStats.flushReasons[reason] = (__chatu8PerfSaveStats.flushReasons[reason] || 0) + 1;
+  __chatu8PerfSaveStats.lastFlushAt = Date.now();
+  __chatu8PerfSaveStats.lastFlushReason = reason;
+}
+function __chatu8PerfSaveContext() {
+  try {
+    const st = typeof globalThis !== "undefined" ? globalThis.SillyTavern : null;
+    const ctx = st && typeof st.getContext === "function" ? st.getContext() : null;
+    return ctx && typeof ctx === "object" ? ctx : null;
+  } catch (_) {
+    return null;
+  }
+}
+function __chatu8PerfSaveArmConfirmation() {
+  if (!__chatu8PerfSaveMergeEnabled) return;
+  __chatu8PerfSaveUnconfirmed = true;
+  if (!__chatu8PerfSaveConfirmationReady) {
+    const ctx = __chatu8PerfSaveContext();
+    const source = ctx && ctx.eventSource;
+    if (!source || typeof source.on !== "function") {
+      // No confirmation channel available: keep the original fire-and-forget behaviour.
+      __chatu8PerfSaveUnconfirmed = false;
+      return;
+    }
+    const eventName = ctx.eventTypes && ctx.eventTypes.SETTINGS_UPDATED ? ctx.eventTypes.SETTINGS_UPDATED : "settings_updated";
+    try {
+      source.on(eventName, () => {
+        // Any successful full save serialises extension_settings, so it also carries the registry.
+        __chatu8PerfSaveStats.confirmations++;
+        __chatu8PerfSaveUnconfirmed = false;
+        __chatu8PerfSaveRetries = 0;
+        if (__chatu8PerfSaveRetryTimer !== null) {
+          clearTimeout(__chatu8PerfSaveRetryTimer);
+          __chatu8PerfSaveRetryTimer = null;
+        }
+      });
+      __chatu8PerfSaveConfirmationReady = true;
+    } catch (error) {
+      console.warn("[chatu8-perf] settings save confirmation listener unavailable:", error);
+      __chatu8PerfSaveUnconfirmed = false;
+      return;
+    }
+  }
+  if (__chatu8PerfSaveRetryTimer !== null) clearTimeout(__chatu8PerfSaveRetryTimer);
+  __chatu8PerfSaveRetryTimer = setTimeout(() => {
+    __chatu8PerfSaveRetryTimer = null;
+    if (!__chatu8PerfSaveUnconfirmed) return;
+    if (__chatu8PerfSaveRetries >= __chatu8PerfSaveMaxRetries) {
+      __chatu8PerfSaveUnconfirmed = false;
+      // Keep the registry dirty so the next flush trigger retries the write.
+      __chatu8PerfSaveDirty = true;
+      console.warn("[chatu8-perf] settings save still unconfirmed after " + __chatu8PerfSaveRetries + " retries; registry kept dirty");
+      return;
+    }
+    __chatu8PerfSaveRetries++;
+    __chatu8PerfSaveStats.retries++;
+    console.warn("[chatu8-perf] settings save not confirmed within " + __chatu8PerfSaveConfirmMs + "ms; retry #" + __chatu8PerfSaveRetries);
+    __chatu8PerfSaveFlush("retry");
+  }, __chatu8PerfSaveConfirmMs);
+}
+function __chatu8PerfSaveFlush(reason) {
+  __chatu8PerfSaveDirty = false;
+  __chatu8PerfSaveNote(reason);
+  try {
+    saveSettingsDebounced();
+  } catch (error) {
+    console.error("[chatu8-perf] saveSettingsDebounced threw, keeping registry dirty:", error);
+    __chatu8PerfSaveDirty = true;
+    __chatu8PerfSaveUnconfirmed = false;
+    return false;
+  }
+  if (reason !== "lifecycle") __chatu8PerfSaveArmConfirmation();
+  return true;
+}
+function __chatu8PerfScheduleSettingsSave(reason) {
+  __chatu8PerfSaveStats.requests++;
+  if (__chatu8PerfSaveMergeEnabled && reason === "registry") {
+    if (__chatu8PerfSaveDirty) __chatu8PerfSaveStats.coalesced++;
+    __chatu8PerfSaveDirty = true;
+    return;
+  }
+  __chatu8PerfSaveFlush(reason === "registry" ? "registry" : "index");
+}
+function __chatu8PerfFlushSettingsSave() {
+  if (!__chatu8PerfSaveMergeEnabled) {
+    __chatu8PerfSaveFlush("lifecycle");
+    return true;
+  }
+  if (!__chatu8PerfSaveDirty) return false;
+  return __chatu8PerfSaveFlush("lifecycle");
+}
+(() => {
+  try {
+    if (typeof window === "undefined") return;
+    const state = window.__chatu8perfState || (window.__chatu8perfState = {});
+    state.scheduleSettingsSave = __chatu8PerfScheduleSettingsSave;
+    state.flushSettingsSave = __chatu8PerfFlushSettingsSave;
+    state.settingsSaveStats = __chatu8PerfSaveStats;
+    state.settingsSaveMergeEnabled = __chatu8PerfSaveMergeEnabled;
+    if (typeof document !== "undefined" && typeof document.addEventListener === "function") {
+      document.addEventListener("visibilitychange", () => {
+        if (document.hidden) __chatu8PerfFlushSettingsSave();
+      });
+    }
+    if (typeof window.addEventListener === "function") {
+      window.addEventListener("pagehide", () => {
+        __chatu8PerfFlushSettingsSave();
+      });
+      window.addEventListener("beforeunload", () => {
+        __chatu8PerfFlushSettingsSave();
+      });
+    }
+  } catch (error) {
+    console.warn("[chatu8-perf] lifecycle flush registration failed:", error);
+  }
+})();
+// ===== end chatu8-perf T05 =====
 async function _saveJsonData(storageKey, data) {
   const jsonString = JSON.stringify(data);
   const base64Data = utf8ToBase64(jsonString);
@@ -6898,7 +7742,7 @@ async function _saveJsonData(storageKey, data) {
         path: result.path,
         date: Date.now()
       };
-      saveSettingsDebounced2();
+      __chatu8PerfScheduleSettingsSave("registry");
       console.log(`[ConfigDB] JSON \u6570\u636E\u5DF2\u4FDD\u5B58\u5230\u670D\u52A1\u5668: ${storageKey}`);
       try {
         await dbWriteConfigImage(storageKey, imageBuffer);
@@ -6949,7 +7793,293 @@ async function _tryFetchJsonFromPath(url, storageKey) {
   }
   return null;
 }
-function _getCandidateServerPaths(storageKey) {
+// ===== chatu8-perf T06: log-registry cleanup fix + candidate-path cache (rollback: window.__chatu8perf = { logCleanupFix: false, pathCache: false }) =====
+// Part 1: the legacy cleanup read extension_settings.logState.sessions AFTER persistLogIndex
+// had already overwritten it with the retention-filtered list, so staleIds was always empty and
+// configImageStorage grew without bound. The fixed pass compares the pre-cleanup session list and
+// the registry itself, deletes only entries that are provably expired or beyond a conservative
+// cap, never the active/held session, and drains deletions in bounded background batches.
+// Part 2: the "which directory holds chatu8_config files" scan over the whole registry (measured
+// tens of ms on a 70k-entry registry) is memoised; a cache miss falls back to a forced rescan.
+var __chatu8PerfLogCleanupEnabled = (() => {
+  try {
+    return !(typeof window !== "undefined" && window.__chatu8perf && window.__chatu8perf.logCleanupFix === false);
+  } catch (_) {
+    return true;
+  }
+})();
+var __chatu8PerfPathCacheEnabled = (() => {
+  try {
+    return !(typeof window !== "undefined" && window.__chatu8perf && window.__chatu8perf.pathCache === false);
+  } catch (_) {
+    return true;
+  }
+})();
+var __chatu8PerfMaxRegistryLogSessions = (() => {
+  try {
+    const v = typeof window !== "undefined" && window.__chatu8perf ? window.__chatu8perf.maxRegistryLogSessions : void 0;
+    return typeof v === "number" && Number.isFinite(v) && v >= 1 ? v : 120;
+  } catch (_) {
+    return 120;
+  }
+})();
+var __chatu8PerfLogCleanupRescanMs = (() => {
+  try {
+    const v = typeof window !== "undefined" && window.__chatu8perf ? window.__chatu8perf.logCleanupRescanMs : void 0;
+    return typeof v === "number" && Number.isFinite(v) && v >= 5e3 ? v : 6e4;
+  } catch (_) {
+    return 6e4;
+  }
+})();
+var __chatu8PerfLogCleanupBatchSize = 8;
+var __chatu8PerfLogCleanupTickMs = 500;
+var __chatu8PerfLogCleanupQueue = [];
+var __chatu8PerfLogCleanupQueued = /* @__PURE__ */ new Set();
+var __chatu8PerfLogCleanupTimer = null;
+var __chatu8PerfLogCleanupRunning = false;
+var __chatu8PerfLogCleanupLastScan = 0;
+var __chatu8PerfLogCleanupLastSave = 0;
+var __chatu8PerfLogCleanupStartupScan = true;
+var __chatu8PerfLogCleanupRegistryDirty = false;
+var __chatu8PerfLogCleanupStats = { scans: 0, queued: 0, deleted: 0, skippedUnknownAge: 0, protected: 0, lastScanCandidates: 0, fallbackSaves: 0 };
+var __chatu8PerfPathCacheDirs = [];
+var __chatu8PerfPathCacheAt = 0;
+var __chatu8PerfPathCacheTtlMs = 3e5;
+var __chatu8PerfPathCacheStats = { hits: 0, misses: 0, scans: 0 };
+function __chatu8PerfLogSessionStorageKey(sessionId) {
+  return "log_session_data_" + sessionId;
+}
+function __chatu8PerfIsProtectedLogSession(sessionId) {
+  const settings3 = extension_settings3[extensionName];
+  const state3 = settings3 ? settings3.logState : null;
+  if (!state3) return false;
+  if (state3.activeSessionId && state3.activeSessionId === sessionId) return true;
+  const sessions = state3.sessions;
+  if (Array.isArray(sessions)) {
+    for (const session of sessions) {
+      if (session && session.id === sessionId) return true;
+    }
+  }
+  return false;
+}
+function __chatu8PerfRegistrySaveRequest() {
+  const state = typeof window !== "undefined" ? window.__chatu8perfState : null;
+  if (state && typeof state.scheduleSettingsSave === "function") {
+    state.scheduleSettingsSave("registry");
+    return;
+  }
+  try {
+    saveSettingsDebounced();
+  } catch (error) {
+    console.warn("[chatu8-perf] registry save request failed:", error);
+  }
+}
+function __chatu8PerfCollectStaleLogSessions(indexData, previousSessions) {
+  const settings3 = extension_settings3[extensionName] || {};
+  const registry = settings3.configImageStorage || {};
+  const prefix = "log_session_data_";
+  const retained = /* @__PURE__ */ new Set();
+  ((indexData && indexData.sessions) || []).forEach((session) => {
+    if (session && session.id) retained.add(session.id);
+  });
+  const held = /* @__PURE__ */ new Set();
+  (Array.isArray(previousSessions) ? previousSessions : []).forEach((session) => {
+    if (session && session.id) held.add(session.id);
+  });
+  const activeId = indexData && indexData.activeSessionId || settings3.logState && settings3.logState.activeSessionId || "";
+  const now = Date.now();
+  const cutoff = now - LOG_RETENTION_MS;
+  const candidates = [];
+  let protectedCount = 0;
+  let skippedUnknownAge = 0;
+  for (const key of Object.keys(registry)) {
+    if (key.length <= prefix.length || key.indexOf(prefix) !== 0) continue;
+    const sessionId = key.slice(prefix.length);
+    if (!sessionId) continue;
+    if (sessionId === activeId || retained.has(sessionId) || held.has(sessionId)) {
+      protectedCount++;
+      continue;
+    }
+    const entry = registry[key];
+    const date = entry && typeof entry.date === "number" && Number.isFinite(entry.date) ? entry.date : 0;
+    if (date <= 0) {
+      skippedUnknownAge++;
+      continue;
+    }
+    candidates.push({ id: sessionId, date });
+  }
+  candidates.sort((a, b) => b.date - a.date);
+  const capSlots = Math.max(0, __chatu8PerfMaxRegistryLogSessions - protectedCount);
+  const stale = [];
+  let keptByCap = 0;
+  for (const item of candidates) {
+    if (item.date <= cutoff) {
+      stale.push(item.id);
+      continue;
+    }
+    if (keptByCap < capSlots) {
+      keptByCap++;
+      continue;
+    }
+    stale.push(item.id);
+  }
+  return { stale, protectedCount, skippedUnknownAge, candidateCount: candidates.length };
+}
+function __chatu8PerfScanLogRegistry(indexData, previousSessions, force) {
+  if (!__chatu8PerfLogCleanupEnabled) return null;
+  const now = Date.now();
+  if (!force && __chatu8PerfLogCleanupLastScan && now - __chatu8PerfLogCleanupLastScan < __chatu8PerfLogCleanupRescanMs) return null;
+  __chatu8PerfLogCleanupLastScan = now;
+  __chatu8PerfLogCleanupStats.scans++;
+  const result = __chatu8PerfCollectStaleLogSessions(indexData, previousSessions);
+  __chatu8PerfLogCleanupStats.skippedUnknownAge = result.skippedUnknownAge;
+  __chatu8PerfLogCleanupStats.protected = result.protectedCount;
+  __chatu8PerfLogCleanupStats.lastScanCandidates = result.candidateCount;
+  let queued = 0;
+  for (const sessionId of result.stale) {
+    if (__chatu8PerfLogCleanupQueued.has(sessionId)) continue;
+    if (__chatu8PerfIsProtectedLogSession(sessionId)) continue;
+    __chatu8PerfLogCleanupQueued.add(sessionId);
+    __chatu8PerfLogCleanupQueue.push(sessionId);
+    queued++;
+  }
+  __chatu8PerfLogCleanupStats.queued += queued;
+  if (queued > 0) __chatu8PerfScheduleLogCleanup(0);
+  return result;
+}
+function __chatu8PerfScheduleLogCleanup(delay) {
+  if (__chatu8PerfLogCleanupTimer !== null) return;
+  if (typeof setTimeout !== "function") return;
+  __chatu8PerfLogCleanupTimer = setTimeout(() => {
+    __chatu8PerfLogCleanupTimer = null;
+    __chatu8PerfLogCleanupPump();
+  }, Math.max(0, delay || 0));
+}
+function __chatu8PerfCancelLogCleanup() {
+  __chatu8PerfLogCleanupQueue = [];
+  __chatu8PerfLogCleanupQueued = /* @__PURE__ */ new Set();
+  if (__chatu8PerfLogCleanupTimer !== null) {
+    clearTimeout(__chatu8PerfLogCleanupTimer);
+    __chatu8PerfLogCleanupTimer = null;
+  }
+  __chatu8PerfLogCleanupRunning = false;
+}
+function __chatu8PerfLogCleanupPump() {
+  if (!__chatu8PerfLogCleanupEnabled) {
+    __chatu8PerfCancelLogCleanup();
+    return;
+  }
+  if (__chatu8PerfLogCleanupRunning) return;
+  const registry = (extension_settings3[extensionName] || {}).configImageStorage;
+  if (!registry) {
+    __chatu8PerfCancelLogCleanup();
+    return;
+  }
+  if (typeof document !== "undefined" && document.hidden) {
+    __chatu8PerfScheduleLogCleanup(__chatu8PerfLogCleanupTickMs * 4);
+    return;
+  }
+  const batch = [];
+  while (batch.length < __chatu8PerfLogCleanupBatchSize && __chatu8PerfLogCleanupQueue.length > 0) {
+    const sessionId = __chatu8PerfLogCleanupQueue.shift();
+    __chatu8PerfLogCleanupQueued.delete(sessionId);
+    if (!sessionId) continue;
+    if (!registry[__chatu8PerfLogSessionStorageKey(sessionId)]) continue;
+    if (__chatu8PerfIsProtectedLogSession(sessionId)) continue;
+    batch.push(sessionId);
+  }
+  if (batch.length === 0) {
+    if (__chatu8PerfLogCleanupRegistryDirty) {
+      __chatu8PerfLogCleanupRegistryDirty = false;
+      __chatu8PerfRegistrySaveRequest();
+    }
+    return;
+  }
+  __chatu8PerfLogCleanupRunning = true;
+  __chatu8PerfLogCleanupRegistryDirty = true;
+  (async () => {
+    for (const sessionId of batch) {
+      const key = __chatu8PerfLogSessionStorageKey(sessionId);
+      const entry = registry[key];
+      if (!entry) continue;
+      if (entry.path) {
+        try {
+          await fetch("/api/images/delete", { method: "POST", headers: getRequestHeaders(window.token), body: JSON.stringify({ path: entry.path }) });
+        } catch (error) {
+          console.warn("[chatu8-perf] log registry cleanup: server delete failed:", key, error);
+        }
+      }
+      delete registry[key];
+      try {
+        await dbDeleteConfigImage(key);
+      } catch (error) {
+        console.warn("[chatu8-perf] log registry cleanup: IndexedDB delete failed:", key, error);
+      }
+      __chatu8PerfLogCleanupStats.deleted++;
+    }
+  })().catch((error) => {
+    console.error("[chatu8-perf] log registry cleanup batch failed:", error);
+  }).then(() => {
+    __chatu8PerfLogCleanupRunning = false;
+    if (!__chatu8PerfLogCleanupEnabled) return;
+    if (__chatu8PerfLogCleanupQueue.length > 0) {
+      __chatu8PerfScheduleLogCleanup(__chatu8PerfLogCleanupTickMs);
+    } else if (__chatu8PerfLogCleanupRegistryDirty) {
+      __chatu8PerfLogCleanupRegistryDirty = false;
+      __chatu8PerfRegistrySaveRequest();
+    }
+  });
+}
+function __chatu8PerfResolveConfigDirs(serverStorage, force) {
+  const now = Date.now();
+  if (!force && __chatu8PerfPathCacheDirs.length > 0 && now - __chatu8PerfPathCacheAt < __chatu8PerfPathCacheTtlMs) {
+    __chatu8PerfPathCacheStats.hits++;
+    return __chatu8PerfPathCacheDirs;
+  }
+  __chatu8PerfPathCacheStats.misses++;
+  __chatu8PerfPathCacheStats.scans++;
+  const dirs = [];
+  const seen = /* @__PURE__ */ new Set();
+  try {
+    for (const entry of Object.values(serverStorage)) {
+      const p = entry && entry.path;
+      if (!p || typeof p !== "string" || !p.includes("chatu8_config") || !p.includes("/")) continue;
+      const dir = p.substring(0, p.lastIndexOf("/") + 1);
+      if (seen.has(dir)) continue;
+      seen.add(dir);
+      dirs.push(dir);
+      if (dirs.length >= 4) break;
+    }
+  } catch (error) {
+    console.warn("[chatu8-perf] candidate path cache scan failed:", error);
+  }
+  __chatu8PerfPathCacheDirs = dirs;
+  __chatu8PerfPathCacheAt = now;
+  return dirs;
+}
+function __chatu8PerfInvalidatePathCache() {
+  __chatu8PerfPathCacheDirs = [];
+  __chatu8PerfPathCacheAt = 0;
+}
+(() => {
+  try {
+    if (typeof window === "undefined") return;
+    const state = window.__chatu8perfState || (window.__chatu8perfState = {});
+    state.logRegistryCleanupStats = __chatu8PerfLogCleanupStats;
+    state.pathCacheStats = __chatu8PerfPathCacheStats;
+    state.maxRegistryLogSessions = __chatu8PerfMaxRegistryLogSessions;
+    state.cancelLogRegistryCleanup = __chatu8PerfCancelLogCleanup;
+    state.invalidatePathCache = __chatu8PerfInvalidatePathCache;
+    state.runLogRegistryCleanup = (force) => {
+      const state3 = ensureLogStateContainer();
+      return __chatu8PerfScanLogRegistry({ version: 1, activeSessionId: state3.activeSessionId || "", sessions: [...state3.sessions || []] }, state3.sessions || [], force !== false);
+    };
+  } catch (error) {
+    console.warn("[chatu8-perf] T06 state registration failed:", error);
+  }
+})();
+// ===== end chatu8-perf T06 =====
+function _getCandidateServerPaths(storageKey, force) {
   const candidates = /* @__PURE__ */ new Set();
   const serverStorage = extension_settings2[extensionName]?.configImageStorage || {};
   const fileName = `${storageKey}.png`;
@@ -6964,10 +8094,17 @@ function _getCandidateServerPaths(storageKey) {
       candidates.add(`${dir}${fileName}`);
     }
   }
-  for (const entry of Object.values(serverStorage)) {
-    const p = entry?.path;
-    if (p && typeof p === "string" && p.includes("chatu8_config") && p.includes("/")) {
-      const dir = p.substring(0, p.lastIndexOf("/") + 1);
+  if (!__chatu8PerfPathCacheEnabled) {
+    for (const entry of Object.values(serverStorage)) {
+      const p = entry?.path;
+      if (p && typeof p === "string" && p.includes("chatu8_config") && p.includes("/")) {
+        const dir = p.substring(0, p.lastIndexOf("/") + 1);
+        candidates.add(`${dir}${fileName}`);
+      }
+    }
+  } else {
+    const cachedDirs = __chatu8PerfResolveConfigDirs(serverStorage, force === true);
+    for (const dir of cachedDirs) {
       candidates.add(`${dir}${fileName}`);
     }
   }
@@ -6995,6 +8132,22 @@ async function _getJsonData(storageKey) {
         saveSettingsDebounced2();
       }
       return data;
+    }
+  }
+  if (__chatu8PerfPathCacheEnabled) {
+    const refreshedPaths = _getCandidateServerPaths(storageKey, true);
+    for (const path of refreshedPaths) {
+      if (candidatePaths.indexOf(path) !== -1) continue;
+      const data = await _tryFetchJsonFromPath(path, storageKey);
+      if (data) {
+        const serverStorage2 = ensureServerStorage();
+        if (!serverStorage2[storageKey] || serverStorage2[storageKey].path !== path) {
+          console.log("[chatu8-perf] candidate path cache refreshed and recovered " + storageKey + " -> " + path);
+          serverStorage2[storageKey] = { path, date: Date.now() };
+          __chatu8PerfRegistrySaveRequest();
+        }
+        return data;
+      }
     }
   }
   try {
@@ -7561,6 +8714,234 @@ var init_configDatabase = __esm({
 // utils/utils.js
 
 
+// ===== chatu8-perf T05b: single settings-save scheduler + window.__chatu8perfState.settings.flush() =====
+// Additive patch: applies to the frozen base and on top of the r1 cumulative result.
+// Rollback: window.__chatu8perf = { settingsSaveMerge: false } -> window.__chatu8perfState.settings
+// is not created (callers must feature-detect) and every adopted call site behaves like pre-patch.
+//
+// Why this exists
+//   * T05 merged the log-session chain, but a generation still produced two full saves: the
+//     statistics save in recordGeneration() at GENERATE_IMAGE_RESPONSE time (a partial state,
+//     without the new image entry) and the tail save more than one second later, which ST's own
+//     1000ms debounce cannot merge. This block owns both decision points.
+//   * T05 also amplified saves when SETTINGS_UPDATED never arrived (one index save -> 3 calls).
+//     Here SETTINGS_UPDATED is telemetry only: it never schedules, re-arms or resets anything.
+//
+// Scheduler contract
+//   __chatu8PerfXSchedule("index")    -> persist now unless a save is in flight or started less
+//                                        than settingsSaveBurstGuardMs ago (then it is coalesced).
+//   __chatu8PerfXSchedule("registry") -> mark dirty only; persisted by the next full save
+//                                        (tail / lifecycle / flush). Used by the log chain, the
+//                                        JSON registry chain and the imageGenStats save.
+//   window.__chatu8perfState.settings.flush(options) -> Promise<{saved, mode, dirty, ...}>
+//        - resolves with the in-flight save when one is running (single POST, shared promise),
+//        - otherwise writes now when something is dirty,
+//        - {force:true} ignores the burst guard and always writes when dirty,
+//        - never rejects; a failed save keeps the state dirty for the next trigger.
+var __chatu8PerfXMergeEnabled = (() => {
+  try {
+    return !(typeof window !== "undefined" && window.__chatu8perf && window.__chatu8perf.settingsSaveMerge === false);
+  } catch (_) {
+    return true;
+  }
+})();
+var __chatu8PerfXBurstGuardMs = (() => {
+  try {
+    const v = typeof window !== "undefined" && window.__chatu8perf ? window.__chatu8perf.settingsSaveBurstGuardMs : void 0;
+    return typeof v === "number" && Number.isFinite(v) && v >= 0 ? v : 300;
+  } catch (_) {
+    return 300;
+  }
+})();
+var __chatu8PerfXImmediateFn = (() => {
+  try {
+    const m = __chatu8PerfScriptModule;
+    return m && typeof m.saveSettings === "function" ? m.saveSettings : null;
+  } catch (_) {
+    return null;
+  }
+})();
+var __chatu8PerfXDirty = false;
+var __chatu8PerfXDirtyKind = "";
+var __chatu8PerfXInFlight = null;
+var __chatu8PerfXLastStartedAt = 0;
+var __chatu8PerfXStats = { requests: 0, coalesced: 0, saves: 0, modes: {}, confirmations: 0, dirty: false, inFlight: false, lastStartedAt: 0, lastCompletedAt: 0 };
+function __chatu8PerfXContext() {
+  try {
+    const st = typeof globalThis !== "undefined" ? globalThis.SillyTavern : null;
+    const ctx = st && typeof st.getContext === "function" ? st.getContext() : null;
+    return ctx && typeof ctx === "object" ? ctx : null;
+  } catch (_) {
+    return null;
+  }
+}
+function __chatu8PerfXExecute(reason, force) {
+  if (__chatu8PerfXInFlight) {
+    __chatu8PerfXStats.coalesced++;
+    return __chatu8PerfXInFlight;
+  }
+  const now = Date.now();
+  if (!force && __chatu8PerfXLastStartedAt && now - __chatu8PerfXLastStartedAt < __chatu8PerfXBurstGuardMs) {
+    __chatu8PerfXStats.coalesced++;
+    return Promise.resolve({ saved: false, mode: "coalesced", reason, dirty: __chatu8PerfXDirty, sinceLastSaveMs: now - __chatu8PerfXLastStartedAt, burstGuardMs: __chatu8PerfXBurstGuardMs });
+  }
+  __chatu8PerfXDirty = false;
+  __chatu8PerfXDirtyKind = "";
+  __chatu8PerfXLastStartedAt = now;
+  __chatu8PerfXStats.saves++;
+  __chatu8PerfXStats.lastStartedAt = now;
+  __chatu8PerfXStats.inFlight = true;
+  const immediate = __chatu8PerfXImmediateFn;
+  const mode = immediate ? "immediate" : "debounced";
+  __chatu8PerfXStats.modes[mode] = (__chatu8PerfXStats.modes[mode] || 0) + 1;
+  let callPromise;
+  try {
+    callPromise = immediate ? immediate() : saveSettingsDebounced();
+  } catch (error) {
+    __chatu8PerfXStats.inFlight = false;
+    __chatu8PerfXDirty = true;
+    console.error("[chatu8-perf] settings save call threw:", error);
+    return Promise.resolve({ saved: false, mode: "error", reason, error: String(error && error.message || error), dirty: true });
+  }
+  const finish = Promise.resolve(callPromise).then(() => {
+    __chatu8PerfXStats.lastCompletedAt = Date.now();
+    return { saved: true, mode, reason, dirty: __chatu8PerfXDirty };
+  }, (error) => {
+    __chatu8PerfXDirty = true;
+    __chatu8PerfXStats.dirty = true;
+    console.error("[chatu8-perf] settings save failed:", error);
+    return { saved: false, mode: "error", reason, error: String(error && error.message || error), dirty: true };
+  }).then((result) => {
+    __chatu8PerfXStats.inFlight = false;
+    __chatu8PerfXStats.dirty = __chatu8PerfXDirty;
+    if (__chatu8PerfXInFlight === finish) __chatu8PerfXInFlight = null;
+    return result;
+  }, (error) => {
+    __chatu8PerfXStats.inFlight = false;
+    if (__chatu8PerfXInFlight === finish) __chatu8PerfXInFlight = null;
+    throw error;
+  });
+  __chatu8PerfXInFlight = finish;
+  return finish;
+}
+function __chatu8PerfXSchedule(reason) {
+  __chatu8PerfXStats.requests++;
+  if (!__chatu8PerfXMergeEnabled) {
+    try {
+      saveSettingsDebounced();
+    } catch (error) {
+      console.error("[chatu8-perf] saveSettingsDebounced threw:", error);
+    }
+    return;
+  }
+  if (reason === "registry") {
+    __chatu8PerfXDirty = true;
+    if (__chatu8PerfXDirtyKind !== "index" && __chatu8PerfXDirtyKind !== "index-coalesced") __chatu8PerfXDirtyKind = "registry";
+    __chatu8PerfXStats.dirty = true;
+    return;
+  }
+  if (__chatu8PerfXInFlight) {
+    __chatu8PerfXDirty = true;
+    __chatu8PerfXDirtyKind = "index-coalesced";
+    __chatu8PerfXStats.dirty = true;
+    __chatu8PerfXStats.coalesced++;
+    return;
+  }
+  const now = Date.now();
+  if (__chatu8PerfXLastStartedAt && now - __chatu8PerfXLastStartedAt < __chatu8PerfXBurstGuardMs) {
+    __chatu8PerfXDirty = true;
+    __chatu8PerfXDirtyKind = "index-coalesced";
+    __chatu8PerfXStats.dirty = true;
+    __chatu8PerfXStats.coalesced++;
+    return;
+  }
+  __chatu8PerfXDirty = true;
+  __chatu8PerfXDirtyKind = "index";
+  __chatu8PerfXStats.dirty = true;
+  const started = __chatu8PerfXExecute("index", false);
+  if (started && typeof started.then === "function") {
+    started.then(() => {}, (error) => console.error("[chatu8-perf] index settings save failed:", error));
+  }
+}
+function __chatu8PerfXFlush(options) {
+  const force = !!(options && options.force);
+  if (!__chatu8PerfXMergeEnabled) return Promise.resolve({ saved: false, mode: "disabled", reason: "flush", dirty: false });
+  if (__chatu8PerfXInFlight) {
+    __chatu8PerfXStats.coalesced++;
+    return __chatu8PerfXInFlight;
+  }
+  if (!__chatu8PerfXDirty && !force) return Promise.resolve({ saved: false, mode: "noop", reason: "flush", dirty: false });
+  if (!force && __chatu8PerfXDirtyKind === "index-coalesced") {
+    return Promise.resolve({ saved: false, mode: "coalesced", reason: "flush", dirty: true, sinceLastSaveMs: __chatu8PerfXLastStartedAt ? Date.now() - __chatu8PerfXLastStartedAt : null });
+  }
+  return __chatu8PerfXExecute(force ? "flush-force" : "flush", force);
+}
+function __chatu8PerfXLifecycleFlush() {
+  if (!__chatu8PerfXMergeEnabled) {
+    try {
+      saveSettingsDebounced();
+    } catch (error) {
+      console.error("[chatu8-perf] lifecycle settings save failed:", error);
+    }
+    return false;
+  }
+  const result = __chatu8PerfXFlush({ force: true });
+  if (result && typeof result.then === "function") result.then(() => {}, () => {});
+  return true;
+}
+(function __chatu8PerfXInstall() {
+  try {
+    if (typeof window === "undefined") return;
+    const hasT05Scheduler = typeof __chatu8PerfScheduleSettingsSave === "function";
+    if (hasT05Scheduler) {
+      // T05's scheduler is superseded: its call sites and its lifecycle listeners resolve these
+      // module-scope bindings at call time, so exactly one scheduler stays active.
+      __chatu8PerfScheduleSettingsSave = __chatu8PerfXSchedule;
+      __chatu8PerfFlushSettingsSave = __chatu8PerfXLifecycleFlush;
+      __chatu8PerfSaveStats = __chatu8PerfXStats;
+    }
+    const state = window.__chatu8perfState || (window.__chatu8perfState = {});
+    state.scheduleSettingsSave = __chatu8PerfXSchedule;
+    state.flushSettingsSave = __chatu8PerfXLifecycleFlush;
+    state.settingsSaveStats = __chatu8PerfXStats;
+    state.settingsSaveMergeEnabled = __chatu8PerfXMergeEnabled;
+    state.t05b = { active: true, overrodeT05Scheduler: hasT05Scheduler, immediateSaveAvailable: !!__chatu8PerfXImmediateFn, burstGuardMs: __chatu8PerfXBurstGuardMs, usesSettingsUpdatedForScheduling: false };
+    if (__chatu8PerfXMergeEnabled) {
+      state.settings = {
+        flush: __chatu8PerfXFlush,
+        stats: __chatu8PerfXStats,
+        burstGuardMs: __chatu8PerfXBurstGuardMs,
+        immediateSaveAvailable: !!__chatu8PerfXImmediateFn,
+        contract: "flush(options?) -> Promise<{saved,mode,dirty}>. Coalesces with an in-flight save and with saves younger than burstGuardMs; pass {force:true} to write anyway. Never rejects; a failed save leaves the state dirty for the next trigger."
+      };
+    }
+    if (!hasT05Scheduler) {
+      if (typeof document !== "undefined" && typeof document.addEventListener === "function") {
+        document.addEventListener("visibilitychange", () => {
+          if (document.hidden) __chatu8PerfXLifecycleFlush();
+        });
+      }
+      if (typeof window.addEventListener === "function") {
+        window.addEventListener("pagehide", () => { __chatu8PerfXLifecycleFlush(); });
+        window.addEventListener("beforeunload", () => { __chatu8PerfXLifecycleFlush(); });
+      }
+    }
+    const ctx = __chatu8PerfXContext();
+    if (ctx && ctx.eventSource && typeof ctx.eventSource.on === "function") {
+      const eventName = ctx.eventTypes && ctx.eventTypes.SETTINGS_UPDATED ? ctx.eventTypes.SETTINGS_UPDATED : "settings_updated";
+      ctx.eventSource.on(eventName, () => {
+        // telemetry only - never used to schedule, re-arm or reset a save
+        __chatu8PerfXStats.confirmations++;
+      });
+      state.t05b.confirmationChannel = "telemetry-only";
+    } else {
+      state.t05b.confirmationChannel = "none";
+    }
+  } catch (error) {
+    console.warn("[chatu8-perf] T05b install failed:", error);
+  }
+})();
+// ===== end chatu8-perf T05b =====
 function generateLogSessionId() {
   if (crypto && crypto.randomUUID) {
     return `log_${crypto.randomUUID()}`;
@@ -7634,7 +9015,14 @@ function schedulePersist() {
     queueLogPersistence(() => persistActiveLogSession());
   }, LOG_PERSIST_DEBOUNCE_MS);
 }
-async function removeExpiredLogSessions(indexData) {
+async function removeExpiredLogSessions(indexData, previousSessions) {
+  if (__chatu8PerfLogCleanupEnabled) {
+    // Fixed pass: compares the pre-cleanup session list (previousSessions) and the registry
+    // instead of the already-overwritten logState, then queues bounded background deletions.
+    __chatu8PerfScanLogRegistry(indexData, previousSessions, __chatu8PerfLogCleanupStartupScan);
+    __chatu8PerfLogCleanupStartupScan = false;
+    return;
+  }
   const existingIds = new Set((indexData.sessions || []).map((session) => session.id));
   const persisted = extension_settings3[extensionName].logState?.sessions || [];
   const staleIds = persisted.map((item) => item.id).filter((id) => !existingIds.has(id));
@@ -7648,6 +9036,7 @@ async function removeExpiredLogSessions(indexData) {
 }
 async function persistLogIndex() {
   const state3 = ensureLogStateContainer();
+  const previousSessions = Array.isArray(state3.sessions) ? state3.sessions : [];
   const normalized = cleanupExpiredSessionMeta({
     version: 1,
     activeSessionId: state3.activeSessionId || "",
@@ -7655,7 +9044,7 @@ async function persistLogIndex() {
   });
   state3.activeSessionId = normalized.activeSessionId;
   state3.sessions = normalized.sessions;
-  await removeExpiredLogSessions(normalized);
+  await removeExpiredLogSessions(normalized, previousSessions);
   await saveLogIndex(normalized);
 }
 async function persistActiveLogSession() {
@@ -7687,6 +9076,129 @@ async function ensureActiveLogSession() {
   await persistActiveLogSession();
   return meta.id;
 }
+// ===== chatu8-perf T06b: budgeted, re-entrant log-registry cleanup + complete directory cache =====
+// Additive patch: applies to the frozen base and on top of the r1 cumulative result.
+// It only becomes active when T06's cleanup pass is present (otherwise it is inert by design).
+// Rollback: window.__chatu8perf = { logCleanupBudgetPerRun: 0 } -> the gate hands out no deletions.
+//
+// Why a budget
+//   T06's predicate (older than LOG_RETENTION_MS = 24h, or beyond the newest 120 log sessions)
+//   can flag a very large legacy backlog: the 2026-09-15 user snapshot carried 70,126 stale
+//   log_session_data_* entries. Server file deletion is irreversible, so a single page load must
+//   not be allowed to unlink an unbounded number of files. 2000 per page load is:
+//     - about two minutes of work at T06's drain rate (8 items / 500ms tick),
+//     - enough to clear a 70k legacy backlog over a handful of sessions,
+//     - a hard ceiling on the blast radius of any predicate mistake (<=2000 entries per load).
+//   The quota is re-entrant: every page load starts with a fresh budget and the drain resumes.
+//   Before handing an entry to the drain this gate re-checks that it is still unprotected (never
+//   the active / held / indexed session), that the registry entry still exists, and that the file
+//   it would unlink really belongs to the key (basename === "<storageKey>.png", which is exactly
+//   how _saveJsonData names its uploads). Anything unexpected is skipped and logged, so this
+//   cleanup can never block startup.
+// Directory cache note
+//   T06 memoises the distinct chatu8_config directories with a cap of 4. Measured: the real
+//   registry resolves exactly 1 directory and the multi-directory legacy shape resolves 3, so the
+//   cap is never reached in practice; if it ever is, this wrapper completes the set with one
+//   uncapped scan (the same O(entries) scan the pre-patch code ran on *every* call) and re-caches
+//   it, so a truncated cache can never cause repeated lookups to miss.
+var __chatu8PerfLogCleanupBudgetPerRun = (() => {
+  try {
+    const v = typeof window !== "undefined" && window.__chatu8perf ? window.__chatu8perf.logCleanupBudgetPerRun : void 0;
+    if (typeof v === "number" && Number.isFinite(v) && v >= 0) return v;
+    if (v === false) return 0;
+    return 2000;
+  } catch (_) {
+    return 2000;
+  }
+})();
+var __chatu8PerfLogCleanupBudgetLeft = __chatu8PerfLogCleanupBudgetPerRun;
+var __chatu8PerfLogCleanupBudgetStats = { perRun: __chatu8PerfLogCleanupBudgetPerRun, handedOut: 0, deferredByBudget: 0, skippedUnexpectedPath: 0, skippedProtected: 0, skippedMissingEntry: 0, dirCapCompleted: 0, wrapped: false, drainBatchSize: 8, drainTickMs: 500 };
+function __chatu8PerfPathBelongsToLogKey(storageKey, entry) {
+  if (!entry || typeof entry !== "object") return false;
+  const p = entry.path;
+  if (p === undefined || p === null || p === "") return true;
+  if (typeof p !== "string") return false;
+  return p.slice(-(storageKey.length + 5)) === "/" + storageKey + ".png" || p.slice(-(storageKey.length + 4)) === storageKey + ".png";
+}
+(function __chatu8PerfInstallLogCleanupBudget() {
+  try {
+    if (typeof window === "undefined") return;
+    const state = window.__chatu8perfState || (window.__chatu8perfState = {});
+    state.logRegistryCleanupBudget = __chatu8PerfLogCleanupBudgetStats;
+    if (typeof __chatu8PerfLogCleanupBatchSize === "number") __chatu8PerfLogCleanupBudgetStats.drainBatchSize = __chatu8PerfLogCleanupBatchSize;
+    if (typeof __chatu8PerfLogCleanupTickMs === "number") __chatu8PerfLogCleanupBudgetStats.drainTickMs = __chatu8PerfLogCleanupTickMs;
+    if (typeof __chatu8PerfCollectStaleLogSessions !== "function") return;
+    const originalCollect = __chatu8PerfCollectStaleLogSessions;
+    __chatu8PerfCollectStaleLogSessions = function(indexData, previousSessions) {
+      const result = originalCollect(indexData, previousSessions);
+      if (!__chatu8PerfLogCleanupBudgetPerRun) {
+        return { stale: [], protectedCount: result.protectedCount, skippedUnknownAge: result.skippedUnknownAge, candidateCount: result.candidateCount, budgetDisabled: true };
+      }
+      const registry = (typeof extension_settings3 !== "undefined" && extension_settings3[extensionName] && extension_settings3[extensionName].configImageStorage) || {};
+      const filtered = [];
+      for (const sessionId of result.stale) {
+        // safety gates first: an entry that fails one of them is never handed to the drain,
+        // whatever the remaining budget is, so anomalies stay visible in the counters.
+        if (typeof __chatu8PerfIsProtectedLogSession === "function" && __chatu8PerfIsProtectedLogSession(sessionId)) {
+          __chatu8PerfLogCleanupBudgetStats.skippedProtected++;
+          continue;
+        }
+        const storageKey = "log_session_data_" + sessionId;
+        const entry = registry[storageKey];
+        if (!entry) {
+          __chatu8PerfLogCleanupBudgetStats.skippedMissingEntry++;
+          continue;
+        }
+        if (!__chatu8PerfPathBelongsToLogKey(storageKey, entry)) {
+          __chatu8PerfLogCleanupBudgetStats.skippedUnexpectedPath++;
+          console.warn("[chatu8-perf] log registry cleanup: skipping entry whose path does not match its key:", storageKey, entry.path);
+          continue;
+        }
+        if (__chatu8PerfLogCleanupBudgetLeft <= 0) {
+          __chatu8PerfLogCleanupBudgetStats.deferredByBudget++;
+          continue;
+        }
+        filtered.push(sessionId);
+        __chatu8PerfLogCleanupBudgetLeft--;
+        __chatu8PerfLogCleanupBudgetStats.handedOut++;
+      }
+      return { stale: filtered, protectedCount: result.protectedCount, skippedUnknownAge: result.skippedUnknownAge, candidateCount: result.candidateCount };
+    };
+    if (typeof __chatu8PerfResolveConfigDirs === "function") {
+      const originalResolve = __chatu8PerfResolveConfigDirs;
+      __chatu8PerfResolveConfigDirs = function(serverStorage, force) {
+        const dirs = originalResolve(serverStorage, force);
+        if (dirs.length < 4) return dirs;
+        const all = [];
+        const seen = new Set();
+        try {
+          for (const entry of Object.values(serverStorage)) {
+            const p = entry && entry.path;
+            if (!p || typeof p !== "string" || !p.includes("chatu8_config") || !p.includes("/")) continue;
+            const dir = p.substring(0, p.lastIndexOf("/") + 1);
+            if (seen.has(dir)) continue;
+            seen.add(dir);
+            all.push(dir);
+          }
+        } catch (error) {
+          console.warn("[chatu8-perf] complete config directory scan failed:", error);
+        }
+        if (all.length > dirs.length) {
+          __chatu8PerfPathCacheDirs = all;
+          __chatu8PerfPathCacheAt = Date.now();
+          __chatu8PerfPathCacheStats.scans++;
+          __chatu8PerfLogCleanupBudgetStats.dirCapCompleted = all.length;
+          return all;
+        }
+        return dirs;
+      };
+    }
+    __chatu8PerfLogCleanupBudgetStats.wrapped = true;
+  } catch (error) {
+    console.warn("[chatu8-perf] T06b install failed:", error);
+  }
+})();
+// ===== end chatu8-perf T06b =====
 async function initializeLogPersistence() {
   if (!logPersistenceStatePromise) {
     logPersistenceStatePromise = (async () => {
@@ -8613,6 +10125,80 @@ async function countTokens(messages, model) {
     return -1;
   }
 }
+var _chatu8LogDomFlushTimer = null;
+var _chatu8LogDomDirty = false;
+var _chatu8LogDomFlushBound = false;
+var _chatu8LogBatchEnabledCache = null;
+function _chatu8LogBatchEnabled() {
+  if (_chatu8LogBatchEnabledCache === null) {
+    try {
+      const cfg = window.__chatu8perf;
+      _chatu8LogBatchEnabledCache = !cfg || cfg.logBatch !== false;
+    } catch (e) {
+      _chatu8LogBatchEnabledCache = true;
+    }
+  }
+  return _chatu8LogBatchEnabledCache;
+}
+function _chatu8LogTextareaVisible(logTextarea) {
+  if (!logTextarea) return false;
+  if (logTextarea.offsetParent !== null) return true;
+  if (typeof logTextarea.getClientRects === "function") {
+    try {
+      if (logTextarea.getClientRects().length > 0) return true;
+    } catch (e) {
+    }
+  }
+  return false;
+}
+function flushLogDomUpdate() {
+  if (_chatu8LogDomFlushTimer !== null) {
+    clearTimeout(_chatu8LogDomFlushTimer);
+    _chatu8LogDomFlushTimer = null;
+  }
+  if (!_chatu8LogDomDirty) return;
+  _chatu8LogDomDirty = false;
+  const logTextarea = document.getElementById("ch-log-textarea");
+  if (!logTextarea) return;
+  const MAX_LOG_LENGTH = 1e5;
+  const TRIM_TARGET_LENGTH = 8e4;
+  const displayLog = getLog();
+  if (displayLog.length > MAX_LOG_LENGTH) {
+    let trimmedVal = displayLog.substring(displayLog.length - TRIM_TARGET_LENGTH);
+    const newlineIdx = trimmedVal.indexOf("\n");
+    if (newlineIdx !== -1) trimmedVal = trimmedVal.substring(newlineIdx + 1);
+    logTextarea.value = "\uFF08\u524D\u9762\u7684\u65E5\u5FD7\u5DF2\u6298\u53E0\uFF0C\u8BF7\u5BFC\u51FA\u67E5\u770B\u5B8C\u6574\u65E5\u5FD7\uFF09\n" + trimmedVal;
+  } else {
+    logTextarea.value = displayLog;
+  }
+  logTextarea.scrollTop = logTextarea.scrollHeight;
+}
+function scheduleLogDomUpdate() {
+  const logTextarea = document.getElementById("ch-log-textarea");
+  if (!logTextarea) return;
+  _chatu8LogDomDirty = true;
+  if (!_chatu8LogBatchEnabled()) {
+    flushLogDomUpdate();
+    return;
+  }
+  if (!_chatu8LogDomFlushBound) {
+    _chatu8LogDomFlushBound = true;
+    try {
+      window.addEventListener("pagehide", () => {
+        _chatu8LogDomDirty = true;
+        flushLogDomUpdate();
+      }, { once: true });
+    } catch (e) {
+    }
+  }
+  if (typeof document !== "undefined" && document.hidden) return;
+  if (!_chatu8LogTextareaVisible(logTextarea)) return;
+  if (_chatu8LogDomFlushTimer !== null) return;
+  _chatu8LogDomFlushTimer = setTimeout(() => {
+    _chatu8LogDomFlushTimer = null;
+    flushLogDomUpdate();
+  }, 200);
+}
 function addLog(message) {
   const timestamp = (/* @__PURE__ */ new Date()).toLocaleString();
   const logEntry = `[${timestamp}] ${message}
@@ -8648,19 +10234,7 @@ function addLog(message) {
       session.entryCount = (session.entryCount || 0) + 1;
     });
   }
-  const logTextarea = document.getElementById("ch-log-textarea");
-  if (logTextarea) {
-    let displayLog = getLog();
-    if (displayLog.length > MAX_LOG_LENGTH) {
-      let trimmedVal = displayLog.substring(displayLog.length - TRIM_TARGET_LENGTH);
-      const newlineIdx = trimmedVal.indexOf("\n");
-      if (newlineIdx !== -1) trimmedVal = trimmedVal.substring(newlineIdx + 1);
-      logTextarea.value = "\uFF08\u524D\u9762\u7684\u65E5\u5FD7\u5DF2\u6298\u53E0\uFF0C\u8BF7\u5BFC\u51FA\u67E5\u770B\u5B8C\u6574\u65E5\u5FD7\uFF09\n" + trimmedVal;
-    } else {
-      logTextarea.value = displayLog;
-    }
-    logTextarea.scrollTop = logTextarea.scrollHeight;
-  }
+  scheduleLogDomUpdate();
   schedulePersist();
 }
 function clearLog() {
@@ -19583,6 +21157,14 @@ async function executeTypedLLMRequest(data, requestType, responseEventName, upda
       }
       let reply = "";
       if (stream) {
+        const coalescedResultUpdater = createCoalescedTextUpdater(updateResultUI, "streamUi");
+        const updateStreamUI = (text) => {
+          if (coalescedResultUpdater) {
+            coalescedResultUpdater(text);
+          } else if (updateResultUI) {
+            updateResultUI(text);
+          }
+        };
         const reader = response.body.getReader();
         const decoder = new TextDecoder("utf-8");
         let buffer = "";
@@ -19594,7 +21176,7 @@ async function executeTypedLLMRequest(data, requestType, responseEventName, upda
           if (deltaReasoning) {
             hasReasoning = true;
             reply += deltaReasoning;
-            if (updateResultUI) updateResultUI(reply);
+            updateStreamUI(reply);
           }
           const delta = chunk.choices?.[0]?.delta?.content;
           if (delta) {
@@ -19603,7 +21185,7 @@ async function executeTypedLLMRequest(data, requestType, responseEventName, upda
               reasoningEnded = true;
             }
             reply += delta;
-            if (updateResultUI) updateResultUI(reply);
+            updateStreamUI(reply);
           }
           const toolCalls = chunk.choices?.[0]?.delta?.tool_calls;
           if (Array.isArray(toolCalls) && toolCalls.length > 0) {
@@ -19611,7 +21193,7 @@ async function executeTypedLLMRequest(data, requestType, responseEventName, upda
             if (parsedTool.deltaReasoning) {
               hasReasoning = true;
               reply += parsedTool.deltaReasoning;
-              if (updateResultUI) updateResultUI(reply);
+              updateStreamUI(reply);
             }
             if (parsedTool.deltaContent) {
               if (hasReasoning && !reasoningEnded) {
@@ -19619,7 +21201,7 @@ async function executeTypedLLMRequest(data, requestType, responseEventName, upda
                 reasoningEnded = true;
               }
               reply += parsedTool.deltaContent;
-              if (updateResultUI) updateResultUI(reply);
+              updateStreamUI(reply);
             }
           }
         };
@@ -19655,17 +21237,16 @@ async function executeTypedLLMRequest(data, requestType, responseEventName, upda
         if (hasReasoning && !reasoningEnded) {
           reply += "\n\n";
           reasoningEnded = true;
-          if (updateResultUI) {
-            updateResultUI(reply);
-          }
+          updateStreamUI(reply);
         }
         if (isToolCallEnabled && isEmptyResponse(reply)) {
           const fallback = streamToolCallParser.getFinalFallback();
           if (fallback.content || fallback.reasoning) {
             reply = fallback.reasoning ? fallback.reasoning + "\n\n" + fallback.content : fallback.content;
-            if (updateResultUI) updateResultUI(reply);
+            updateStreamUI(reply);
           }
         }
+        if (coalescedResultUpdater) coalescedResultUpdater.flush();
         if (isEmptyResponse(reply)) {
           if (attempt < maxRetries) {
             lastError = new Error("\u672A\u6536\u5230\u6709\u6548\u56DE\u590D");
@@ -20118,6 +21699,65 @@ function updateCombinedPrompt(promptOrText, diagnosticText = "") {
     displayText += formatPromptForDisplay(promptOrText);
     combinedPromptTextarea.val(displayText);
   }
+}
+function chatu8PerfFlagEnabled(flagName) {
+  try {
+    const cfg = window.__chatu8perf;
+    if (!cfg) return true;
+    return cfg[flagName] !== false;
+  } catch (e) {
+    return true;
+  }
+}
+function createCoalescedTextUpdater(updateFn, flagName) {
+  if (typeof updateFn !== "function") return null;
+  if (!chatu8PerfFlagEnabled(flagName || "streamUi")) {
+    const passthrough = (text) => updateFn(text);
+    passthrough.flush = () => {
+    };
+    passthrough.dispose = () => {
+    };
+    return passthrough;
+  }
+  const UPDATE_INTERVAL = 120;
+  let pending = null;
+  let hasPending = false;
+  let timer = null;
+  let lastFlush = 0;
+  const doFlush = () => {
+    if (timer !== null) {
+      clearTimeout(timer);
+      timer = null;
+    }
+    if (!hasPending) return;
+    const text = pending;
+    pending = null;
+    hasPending = false;
+    lastFlush = Date.now();
+    updateFn(text);
+  };
+  const schedule = (text) => {
+    pending = text;
+    hasPending = true;
+    if (typeof document !== "undefined" && document.hidden) return;
+    const now = Date.now();
+    const elapsed = now - lastFlush;
+    if (elapsed >= UPDATE_INTERVAL) {
+      doFlush();
+    } else if (timer === null) {
+      timer = setTimeout(doFlush, UPDATE_INTERVAL - elapsed);
+    }
+  };
+  schedule.flush = doFlush;
+  schedule.dispose = () => {
+    if (timer !== null) {
+      clearTimeout(timer);
+      timer = null;
+    }
+    pending = null;
+    hasPending = false;
+  };
+  return schedule;
 }
 function getResultTextareaUpdater() {
   return (text) => {
@@ -42436,7 +44076,11 @@ function recordGeneration(backend, success) {
     if (!stats.daily[today]) stats.daily[today] = {};
     stats.daily[today][backend] = (stats.daily[today][backend] || 0) + 1;
   }
-  saveSettingsDebounced27();
+  // merged away: this statistics write used to fire at GENERATE_IMAGE_RESPONSE time with a
+  // settings snapshot that did not contain the new image entry yet, and its ST-debounced POST
+  // then landed >1s after the tail save (two full stringify+POST per generation). It is now a
+  // deferred registry write carried by the next full save (the tail save of the same generation).
+  __chatu8PerfXSchedule("registry");
 }
 function handleImageResponse(_responseData) {
 }
@@ -45179,8 +46823,7 @@ async function comfyuigenerate(requestData) {
   try {
     const { image: imageUrl, change: returnedChange, isVideo, format, genParams } = await generateComfyUIImage({ prompt: prompt2, width, height, change, extraNegativePrompt });
     if (extension_settings48[extensionName].cache != "0") {
-      await setItemImg(prompt2, imageUrl, { change: returnedChange, isVideo, format, genParams });
-      addLog(`${isVideo ? "\u89C6\u9891" : "\u56FE\u50CF"}\u5DF2\u5B58\u5165\u6570\u636E\u5E93 for prompt: ${prompt2}`);
+      await setItemImg(prompt2, imageUrl, { change: returnedChange, isVideo, format, genParams, onTailSuccess: () => addLog(`${isVideo ? "\u89C6\u9891" : "\u56FE\u50CF"}\u5DF2\u5B58\u5165\u6570\u636E\u5E93 for prompt: ${prompt2}`), onTailError: (e) => { const msg = `图片已显示，但保存到数据库失败: ${e && e.message ? e.message : e}`; addLog(`错误: ${msg}`); toastr.error(msg); } });
     } else {
       addLog(`\u7F13\u5B58\u8BBE\u7F6E\u4E3A\u4E0D\u5B58\u5165\u6570\u636E\u5E93`);
     }
@@ -46193,8 +47836,7 @@ async function bananaGenerate(requestData) {
       const { image: imageUrl, change: returnedChange, isVideo, format, genParams } = await generateComfyUIImage({ prompt: prompt2, width, height, change, extraNegativePrompt: void 0 });
       const cleanedChange = returnedChange.replaceAll("{ComfyUI\u5C40\u90E8\u91CD\u7ED8}", "");
       if (extension_settings49[extensionName].cache != "0") {
-        await setItemImg(prompt2, imageUrl, { change: cleanedChange, genParams });
-        addLog(`\u56FE\u50CF\u5DF2\u5B58\u5165\u6570\u636E\u5E93 for prompt: ${prompt2}`);
+        await setItemImg(prompt2, imageUrl, { change: cleanedChange, genParams, onTailSuccess: () => addLog(`\u56FE\u50CF\u5DF2\u5B58\u5165\u6570\u636E\u5E93 for prompt: ${prompt2}`), onTailError: (e) => { const msg = `图片已显示，但保存到数据库失败: ${e && e.message ? e.message : e}`; addLog(`错误: ${msg}`); toastr.error(msg); } });
       } else {
         addLog(`\u7F13\u5B58\u8BBE\u7F6E\u4E3A\u4E0D\u5B58\u5165\u6570\u636E\u5E93`);
       }
@@ -46227,8 +47869,7 @@ async function bananaGenerate(requestData) {
   try {
     const { image: imageUrl, change: returnedChange, isVideo, format, originalUrl, genParams } = await generateBananaImage({ prompt: prompt2, width, height, change, retouchPrompt, retouchImage, videoPrompt, videoImage });
     if (extension_settings49[extensionName].cache != "0") {
-      await setItemImg(prompt2, imageUrl, { change: change_, isVideo: isVideo || false, format: format || "image", originalUrl: originalUrl || "", genParams });
-      addLog(`\u56FE\u50CF\u5DF2\u5B58\u5165\u6570\u636E\u5E93 for prompt: ${prompt2}`);
+      await setItemImg(prompt2, imageUrl, { change: change_, isVideo: isVideo || false, format: format || "image", originalUrl: originalUrl || "", genParams, onTailSuccess: () => addLog(`\u56FE\u50CF\u5DF2\u5B58\u5165\u6570\u636E\u5E93 for prompt: ${prompt2}`), onTailError: (e) => { const msg = `图片已显示，但保存到数据库失败: ${e && e.message ? e.message : e}`; addLog(`错误: ${msg}`); toastr.error(msg); } });
       if (extension_settings49[extensionName].banana.cishu) {
         extension_settings49[extensionName].banana.cishu = extension_settings49[extensionName].banana.cishu + 1;
         addLog(`\u5F53\u524D\u751F\u56FE\u6B21\u6570\u4E3A for prompt: ${extension_settings49[extensionName].banana.cishu}`);
@@ -46993,9 +48634,10 @@ async function runninghubgenerate(requestData) {
         originalUrl: originalUrl || "",
         genParams,
         taskCostTime: taskCostTime || null,
-        consumeCoins: consumeCoins || null
+        consumeCoins: consumeCoins || null,
+        onTailSuccess: () => addLog(`[RunningHub] ${isVideo ? "\u89C6\u9891" : "\u56FE\u50CF"}\u5DF2\u5B58\u5165\u6570\u636E\u5E93 for prompt: ${prompt2}`),
+        onTailError: (e) => { const msg = `图片已显示，但保存到数据库失败: ${e && e.message ? e.message : e}`; addLog(`错误: ${msg}`); toastr.error(msg); }
       });
-      addLog(`[RunningHub] ${isVideo ? "\u89C6\u9891" : "\u56FE\u50CF"}\u5DF2\u5B58\u5165\u6570\u636E\u5E93 for prompt: ${prompt2}`);
     } else {
       addLog(`[RunningHub] \u7F13\u5B58\u8BBE\u7F6E\u4E3A\u4E0D\u5B58\u5165\u6570\u636E\u5E93`);
     }
@@ -50204,6 +51846,63 @@ function createAndShowImage(container, imageUrl, alt, button, change, isVideo = 
     container.replaceChildren(div);
   }
 }
+var _chatu8PendingImageRespHandlers = /* @__PURE__ */ new Map();
+var _chatu8RespDedupBound = false;
+var _chatu8RespDedupEnabledCache = null;
+function _chatu8RespDedupEnabled() {
+  if (_chatu8RespDedupEnabledCache === null) {
+    try {
+      const cfg = window.__chatu8perf;
+      _chatu8RespDedupEnabledCache = !cfg || cfg.listenerDedup !== false;
+    } catch (e) {
+      _chatu8RespDedupEnabledCache = true;
+    }
+  }
+  return _chatu8RespDedupEnabledCache;
+}
+function trackImageResponseHandler(requestId, handler) {
+  if (!requestId || !_chatu8RespDedupEnabled()) {
+    eventSource25.on(EventType.GENERATE_IMAGE_RESPONSE, handler);
+    return;
+  }
+  const key = String(requestId);
+  const previous = _chatu8PendingImageRespHandlers.get(key);
+  if (previous && previous !== handler) {
+    try {
+      eventSource25.removeListener(EventType.GENERATE_IMAGE_RESPONSE, previous);
+    } catch (e) {
+    }
+  }
+  _chatu8PendingImageRespHandlers.set(key, handler);
+  if (!_chatu8RespDedupBound) {
+    _chatu8RespDedupBound = true;
+    try {
+      window.addEventListener("pagehide", () => {
+        _chatu8PendingImageRespHandlers.forEach((h) => {
+          try {
+            eventSource25.removeListener(EventType.GENERATE_IMAGE_RESPONSE, h);
+          } catch (e) {
+          }
+        });
+        _chatu8PendingImageRespHandlers.clear();
+      }, { once: true });
+    } catch (e) {
+    }
+  }
+  eventSource25.on(EventType.GENERATE_IMAGE_RESPONSE, handler);
+}
+function untrackImageResponseHandler(requestId, handler) {
+  if (requestId && _chatu8RespDedupEnabled()) {
+    const key = String(requestId);
+    if (_chatu8PendingImageRespHandlers.get(key) === handler) {
+      _chatu8PendingImageRespHandlers.delete(key);
+    }
+  }
+  try {
+    eventSource25.removeListener(EventType.GENERATE_IMAGE_RESPONSE, handler);
+  } catch (e) {
+  }
+}
 var _showImagePreview, triggerGeneration;
 var init_generation = __esm({
   "utils/iframe/generation.js"() {
@@ -50238,9 +51937,9 @@ var init_generation = __esm({
             button.textContent = "\u89C6\u9891\u751F\u6210\u4E2D...";
             const videoResponseHandler = (responseData) => {
               if (responseData.id !== requestId) return;
-              eventSource25.removeListener(EventType.GENERATE_IMAGE_RESPONSE, videoResponseHandler);
+              untrackImageResponseHandler(requestId, videoResponseHandler);
             };
-            eventSource25.on(EventType.GENERATE_IMAGE_RESPONSE, videoResponseHandler);
+            trackImageResponseHandler(requestId, videoResponseHandler);
             return;
           }
           button.setAttribute("data-loading", "true");
@@ -50259,9 +51958,10 @@ var init_generation = __esm({
                   isVideo: true,
                   format: result.format || "video/mp4",
                   originalUrl: result.originalUrl || "",
-                  genParams: result.genParams
+                  genParams: result.genParams,
+                  onTailSuccess: () => addLog(`[${isRh ? "RunningHubRefVideo" : "ComfyUIVideo"}] \u89C6\u9891\u5DF2\u5B58\u5165\u6570\u636E\u5E93 for prompt: ${link}`),
+                  onTailError: (e) => { const msg = `图片已显示，但保存到数据库失败: ${e && e.message ? e.message : e}`; addLog(`错误: ${msg}`); toastr.error(msg); }
                 });
-                addLog(`[${isRh ? "RunningHubRefVideo" : "ComfyUIVideo"}] \u89C6\u9891\u5DF2\u5B58\u5165\u6570\u636E\u5E93 for prompt: ${link}`);
               }
               stopGenerating(link);
               const docs2 = [document, ...Array.from(document.querySelectorAll("iframe")).map((f) => f.contentDocument).filter(Boolean)];
@@ -50365,7 +52065,7 @@ var init_generation = __esm({
         const imageResponseHandler = (responseData) => {
           if (responseData.id !== requestId) return;
           console.log("Image response:", responseData);
-          eventSource25.removeListener(EventType.GENERATE_IMAGE_RESPONSE, imageResponseHandler);
+          untrackImageResponseHandler(requestId, imageResponseHandler);
           addLog(`\u56FE\u50CF\u54CD\u5E94\u76D1\u542C\u5668\u5DF2\u9500\u6BC1 (ID: ${requestId})`);
           const { success, imageData, error, prompt: prompt2, change: change2, isVideo, originalUrl, video: video2, activeMode: activeMode2 } = responseData;
           if (prompt2) stopGenerating(prompt2);
@@ -50402,7 +52102,7 @@ var init_generation = __esm({
             });
           });
         };
-        eventSource25.on(EventType.GENERATE_IMAGE_RESPONSE, imageResponseHandler);
+        trackImageResponseHandler(requestId, imageResponseHandler);
         addLog(`\u56FE\u50CF\u54CD\u5E94\u76D1\u542C\u5668\u5DF2\u521B\u5EFA (ID: ${requestId})`);
         if (!alreadyGenerating) {
           button.setAttribute("data-loading", "true");
@@ -77382,8 +79082,7 @@ async function sdGenerate(requestData) {
       const { image: imageUrl, change: returnedChange, isVideo, format, genParams } = await generateComfyUIImage({ prompt: prompt2, width, height, change, extraNegativePrompt });
       const cleanedChange = returnedChange.replaceAll("{ComfyUI\u5C40\u90E8\u91CD\u7ED8}", "");
       if (extension_settings57[extensionName].cache != "0") {
-        await setItemImg(prompt2, imageUrl, { change: cleanedChange, genParams });
-        addLog(`\u56FE\u50CF\u5DF2\u5B58\u5165\u6570\u636E\u5E93 for prompt: ${prompt2}`);
+        await setItemImg(prompt2, imageUrl, { change: cleanedChange, genParams, onTailSuccess: () => addLog(`\u56FE\u50CF\u5DF2\u5B58\u5165\u6570\u636E\u5E93 for prompt: ${prompt2}`), onTailError: (e) => { const msg = `图片已显示，但保存到数据库失败: ${e && e.message ? e.message : e}`; addLog(`错误: ${msg}`); toastr.error(msg); } });
       } else {
         addLog(`\u7F13\u5B58\u8BBE\u7F6E\u4E3A\u4E0D\u5B58\u5165\u6570\u636E\u5E93`);
       }
@@ -77416,8 +79115,7 @@ async function sdGenerate(requestData) {
   try {
     const { image: imageUrl, change: returnedChange, genParams } = await generateSDImage({ prompt: prompt2, width, height, change, extraNegativePrompt });
     if (extension_settings57[extensionName].cache != "0") {
-      await setItemImg(prompt2, imageUrl, { change: returnedChange, genParams });
-      addLog(`\u56FE\u50CF\u5DF2\u5B58\u5165\u6570\u636E\u5E93 for prompt: ${prompt2}`);
+      await setItemImg(prompt2, imageUrl, { change: returnedChange, genParams, onTailSuccess: () => addLog(`\u56FE\u50CF\u5DF2\u5B58\u5165\u6570\u636E\u5E93 for prompt: ${prompt2}`), onTailError: (e) => { const msg = `图片已显示，但保存到数据库失败: ${e && e.message ? e.message : e}`; addLog(`错误: ${msg}`); toastr.error(msg); } });
     } else {
       addLog(`\u7F13\u5B58\u8BBE\u7F6E\u4E3A\u4E0D\u5B58\u5165\u6570\u636E\u5E93`);
     }
@@ -82092,8 +83790,7 @@ async function novelaigenerate(requestData) {
       const cleanedChange = returnedChange.replaceAll("{ComfyUI\u5C40\u90E8\u91CD\u7ED8}", "");
       try {
         if (extension_settings61[extensionName].cache != "0") {
-          await setItemImg(prompt2, imageUrl, { change: cleanedChange, isVideo, format, genParams });
-          addLog(`\u56FE\u50CF\u5DF2\u5B58\u5165\u6570\u636E\u5E93 for prompt: ${prompt2}`);
+          await setItemImg(prompt2, imageUrl, { change: cleanedChange, isVideo, format, genParams, onTailSuccess: () => addLog(`\u56FE\u50CF\u5DF2\u5B58\u5165\u6570\u636E\u5E93 for prompt: ${prompt2}`), onTailError: (e) => { const msg = `图片已显示，但保存到数据库失败: ${e && e.message ? e.message : e}`; addLog(`错误: ${msg}`); toastr.error(msg); } });
         } else {
           addLog(`\u7F13\u5B58\u8BBE\u7F6E\u4E3A\u4E0D\u5B58\u5165\u6570\u636E\u5E93`);
         }
@@ -82124,8 +83821,7 @@ async function novelaigenerate(requestData) {
       const cleanedChange = returnedChange.replaceAll("{NovelAI\u5C40\u90E8\u91CD\u7ED8}", "");
       try {
         if (extension_settings61[extensionName].cache != "0") {
-          await setItemImg(prompt2, imageUrl, { change: cleanedChange, genParams });
-          addLog(`\u56FE\u50CF\u5DF2\u5B58\u5165\u6570\u636E\u5E93 for prompt: ${prompt2}`);
+          await setItemImg(prompt2, imageUrl, { change: cleanedChange, genParams, onTailSuccess: () => addLog(`\u56FE\u50CF\u5DF2\u5B58\u5165\u6570\u636E\u5E93 for prompt: ${prompt2}`), onTailError: (e) => { const msg = `图片已显示，但保存到数据库失败: ${e && e.message ? e.message : e}`; addLog(`错误: ${msg}`); toastr.error(msg); } });
         } else {
           addLog(`\u7F13\u5B58\u8BBE\u7F6E\u4E3A\u4E0D\u5B58\u5165\u6570\u636E\u5E93`);
         }
@@ -82176,8 +83872,7 @@ async function novelaigenerate(requestData) {
     const { image: imageUrl, change: returnedChange, genParams } = await generateNovelAIImage({ prompt: prompt2, width, height, change, extraNegativePrompt });
     try {
       if (extension_settings61[extensionName].cache != "0") {
-        await setItemImg(prompt2, imageUrl, { change: returnedChange, genParams });
-        addLog(`\u56FE\u50CF\u5DF2\u5B58\u5165\u6570\u636E\u5E93 for prompt: ${prompt2}`);
+        await setItemImg(prompt2, imageUrl, { change: returnedChange, genParams, onTailSuccess: () => addLog(`\u56FE\u50CF\u5DF2\u5B58\u5165\u6570\u636E\u5E93 for prompt: ${prompt2}`), onTailError: (e) => { const msg = `图片已显示，但保存到数据库失败: ${e && e.message ? e.message : e}`; addLog(`错误: ${msg}`); toastr.error(msg); } });
       } else {
         addLog(`\u7F13\u5B58\u8BBE\u7F6E\u4E3A\u4E0D\u5B58\u5165\u6570\u636E\u5E93`);
       }
@@ -108944,6 +110639,14 @@ function loadcrypto() {
   });
   return cryptoLoadPromise;
 }
+function chatu8ShouldEagerLoadMsgpack() {
+  try {
+    const cfg = window.__chatu8perf;
+    return !!cfg && cfg.skipMsgpackEagerLoad === false;
+  } catch (e) {
+    return false;
+  }
+}
 function loadmsgpack() {
   if (typeof window.stChatu8MessagePack !== "undefined") {
     return Promise.resolve(window.stChatu8MessagePack);
@@ -109252,9 +110955,11 @@ await loadJSZip().then(() => {
 await loadcrypto().then(() => {
   console.log("Initializing..CryptoJS.");
 });
-await loadmsgpack().then(() => {
-  console.log("Initializing..msgpack.");
-});
+if (chatu8ShouldEagerLoadMsgpack()) {
+  await loadmsgpack().then(() => {
+    console.log("Initializing..msgpack.");
+  });
+}
 window.imagesid = "";
 window.xiancheng = true;
 async function checkForUpdates2() {
