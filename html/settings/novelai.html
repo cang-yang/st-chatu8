@@ -212,15 +212,20 @@
             </div>
             <div class="st-chatu8-field">
                 <label for="novelaimode">模型</label>
-                <select id="novelaimode" class="st-chatu8-select">
-                    <option>nai-diffusion-3</option>
-                    <option>nai-diffusion-4-full</option>
-                    <option>nai-diffusion-4-curated-preview</option>
-                    <option>nai-diffusion-4-5-curated</option>
-                    <option>nai-diffusion-4-5-full</option>
-                    <option>nai-diffusion-5-curated</option>
-                    <option>nai-diffusion-5-full</option>
-                </select>
+                <div style="display: flex; flex-direction: column; width: 100%; max-width: 420px; gap: 6px;">
+                    <select id="novelaimode" class="st-chatu8-select">
+                        <option>nai-diffusion-3</option>
+                        <option>nai-diffusion-4-full</option>
+                        <option>nai-diffusion-4-curated-preview</option>
+                        <option>nai-diffusion-4-5-curated</option>
+                        <option>nai-diffusion-4-5-full</option>
+                        <option>nai-diffusion-5-curated</option>
+                        <option>nai-diffusion-5-full</option>
+                    </select>
+                    <button type="button" class="st-chatu8-btn" id="st_chatu8_reset_model_default" title="将当前所选模型的全部生成参数重置为官网出厂默认值">
+                        <i class="fa-solid fa-rotate-left"></i> 重置当前模型为官网默认
+                    </button>
+                </div>
             </div>
             <div class="st-chatu8-field" id="novelai_straight_alpha_container" style="display: none;">
                 <label for="novelai_straight_alpha">透明图片开关 (straight_alpha)</label>
@@ -395,7 +400,7 @@
                 </div>
             </div>
     </div>
-    <div class="st-chatu8-settings-section">
+    <div class="st-chatu8-settings-section" id="nai-vibe-group-section">
         <h3>氛围转移设置</h3>
             <div class="st-chatu8-field">
                 <label>Vibe 文件生成器</label>
