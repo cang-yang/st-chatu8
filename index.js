@@ -16,6 +16,8 @@
  * 尊重原创，从你我做起。
  * ====================================================
  */
+import { RunningHubScheduler, runningHubFetch, runningHubReadWithRetry, runningHubCancelRemote, captureRunningHubTarget, runningHubDownload, runningHubAbortable, runningHubCreationRejected } from "./runninghub-scheduler.mjs";
+import { RunningHubLedger } from "./runninghub-ledger.mjs";
 import { saveSettingsDebounced as saveSettingsDebounced2 } from "../../../../script.js";
 import { extension_settings } from "../../../extensions.js";
 import { saveSettingsDebounced as saveSettingsDebounced3 } from "../../../../script.js";
@@ -14468,6 +14470,7 @@ var init_taskQueue = __esm({
       updateStatus(id, status) {
         const task = this.tasks.get(id);
         if (task) {
+          if (task.status === TaskStatus.CANCELLED && status !== TaskStatus.CANCELLED) return;
           task.status = status;
           if (status === TaskStatus.RUNNING) {
             task.startedAt = Date.now();
@@ -43604,41 +43607,143 @@ function getKeyConsumptionStats(apiKey) {
     total: Math.round(total * 100) / 100
   };
 }
-function releaseTaskKeyLeases(taskId) {
-  if (!taskId) return;
-  const leases = taskLeaseRegistry.get(taskId);
-  if (leases && leases.size > 0) {
-    for (const releaseFn of Array.from(leases)) {
-      try {
-        if (typeof releaseFn === "function") {
-          releaseFn();
+function createRunningHubTaskScope(taskId, timeoutMs) {
+  const controller = new AbortController();
+  const cancel = (data) => {
+    if (data?.taskId === taskId) controller.abort(new Error("任务已取消"));
+  };
+  eventSource20.on("st_chatu8_task_cancelled", cancel);
+  const timer = setTimeout(() => controller.abort(new Error("RunningHub 任务总时限已到")), timeoutMs);
+  return { signal: controller.signal, dispose() {
+    clearTimeout(timer);
+    eventSource20.removeListener("st_chatu8_task_cancelled", cancel);
+  } };
+}
+function renderRunningHubPoolStatus(snapshot, waiting) {
+  const target = document.getElementById("runninghub_scheduler_status");
+  if (!target) return;
+  const phases = { reserved: "待提交", submitting: "提交中", submitted: "远程执行中", uncertain: "远程状态待确认" };
+  const active = snapshot.reduce((total, s) => total + s.active, 0);
+  const globalLimit = getRunningHubScheduler().configuredGlobalLimit();
+  target.textContent = `本地占用：${active} / 全局上限：${Number.isFinite(globalLimit) ? globalLimit : "不额外限制"} · 排队：${waiting}${active >= globalLimit && waiting ? "（等待全局通道空闲）" : ""}\n` + snapshot.map(s =>
+    `${s.key}：本地占用 ${s.active} / 有效上限 ${s.effectiveLimit ?? "查询中"} · 平台额度 ${s.limit ?? "查询中"}` +
+    s.tasks.map(t => `\n  ${t.taskId || t.id} · ${phases[t.phase] || t.phase} · 远程 ID：${t.remoteTaskId || "尚未取得"}`).join("")
+  ).join("\n");
+  const actions = document.getElementById("runninghub_scheduler_actions");
+  if (actions) {
+    actions.replaceChildren();
+    const scheduler = getRunningHubScheduler();
+    const pause = document.createElement("button");
+    pause.className = "st-chatu8-btn";
+    pause.textContent = scheduler.paused ? "恢复本页队列" : "暂停本页新任务";
+    pause.onclick = () => scheduler.setPaused(!scheduler.paused);
+    actions.appendChild(pause);
+    const clear = document.createElement("button");
+    clear.className = "st-chatu8-btn";
+    clear.textContent = "取消本页等待任务";
+    clear.onclick = () => { if (window.confirm("取消所有尚在等待通道的任务？已开始生成的任务不受影响。")) scheduler.cancelWaiting(); };
+    actions.appendChild(clear);
+    for (const state of snapshot) for (const task of state.tasks) {
+      if (task.phase !== "uncertain") continue;
+      const button = document.createElement("button");
+      button.className = "st-chatu8-btn";
+      button.textContent = `核对后释放：${task.taskId || task.id}`;
+      button.onclick = () => {
+        if (window.confirm("请先在 RunningHub 任务列表确认该任务已结束或未创建。远程仍在运行时释放会导致超额提交。确认已核对？")) {
+          getRunningHubScheduler().resolveUncertain(task.id);
         }
-      } catch (e) {
-        console.warn("[RunningHub Key\u6C60] \u515C\u5E95\u91CA\u653E\u79DF\u7EA6\u5F02\u5E38:", e);
+      };
+      actions.appendChild(button);
+    }
+    const ledger = scheduler.ledger;
+    if (ledger) {
+      try {
+        const records = ledger.records();
+        const activeRecords = records.filter(r => r.phase !== "completed");
+        const note = document.createElement("div");
+        note.textContent = `同源浏览器登记占用：${activeRecords.length}；${ledger.error || "结果记录保存在本机，不含 API Key。切换聊天或刷新后可从这里打开结果。"}`;
+        actions.appendChild(note);
+        for (const r of records.slice().sort((a, b) => b.createdAt - a.createdAt).slice(0, 100)) {
+          const row = document.createElement("div");
+          row.textContent = `${r.taskId || r.id.slice(0, 8)} · ${r.phase === "completed" ? r.status : r.phase === "uncertain" ? "远端待确认" : "占用中"} · 远程 ID：${r.remoteTaskId || "未取得"} `;
+          for (const result of r.results || []) {
+            try {
+              const url = new URL(result.url);
+              if (!["https:", "http:"].includes(url.protocol)) continue;
+              const link = document.createElement("a");
+              link.href = url.href; link.target = "_blank"; link.rel = "noopener noreferrer";
+              link.textContent = "打开生成结果 "; row.appendChild(link);
+            } catch (_) {}
+          }
+          if (r.phase === "completed" || r.recovered) {
+            const remove = document.createElement("button");
+            remove.className = "st-chatu8-btn";
+            remove.textContent = r.phase === "completed" ? "移除结果记录" : "核对平台后释放";
+            remove.onclick = async () => {
+              if (!window.confirm(r.phase === "completed" ? "移除本机结果链接记录？平台文件不会被删除。" : "请先确认平台任务已结束或未创建。状态不明时请勿释放。已核对？")) return;
+              try { await ledger.resolve(r.id); scheduler.configurationChanged(); }
+              catch (error) { toastr.error(error.message); }
+            };
+            row.appendChild(remove);
+          }
+          actions.appendChild(row);
+        }
+      } catch (error) {
+        const warning = document.createElement("div"); warning.textContent = `恢复记录读取失败：${error.message}`; actions.appendChild(warning);
       }
     }
-    taskLeaseRegistry.delete(taskId);
   }
 }
+function getRunningHubScheduler() {
+  if (!runningHubScheduler) {
+    runningHubScheduler = new RunningHubScheduler({
+    requireLedger: true,
+    keys: getAllRunningHubApiKeys,
+    limit: getKeyLocalLimit,
+    globalLimit: () => runningHubScheduler?.ledger?.policy().globalLimit ?? extension_settings46[extensionName]?.runninghub_global_local_limit,
+    maxQueue: () => extension_settings46[extensionName]?.runninghub_max_queue ?? 100,
+    pausedKey: key => Boolean(runningHubScheduler?.ledger?.policy().keys?.[runningHubScheduler.ledger.keyIds.get(key)]?.paused ?? extension_settings46[extensionName]?.runninghub_paused_keys?.[key]),
+    cancelRemote: runningHubCancelRemote,
+    probe: async (key) => {
+      const [queue, balance] = await Promise.all([checkKeyQueueAvailability(key), checkKeyHasBalance(key)]);
+      return { queue, balance };
+    },
+    log: addLog,
+    onChange: renderRunningHubPoolStatus
+    });
+    runningHubScheduler.ledger = new RunningHubLedger({
+      keys: getAllRunningHubApiKeys,
+      initialPolicy: () => {
+        const settings = extension_settings46[extensionName] || {};
+        return { globalLimit: settings.runninghub_global_local_limit || 0,
+          keys: Object.fromEntries(getAllRunningHubApiKeys().map(key => [key, { limit: settings.runninghub_key_local_limits?.[key] || 0, paused: Boolean(settings.runninghub_paused_keys?.[key]) }])) };
+      },
+      changed: () => renderRunningHubPoolStatus(runningHubScheduler.snapshot(), runningHubScheduler.waiters.length)
+    });
+    window.addEventListener("storage", event => {
+      if (event.key?.startsWith("st-chatu8:rh:v1:")) runningHubScheduler.configurationChanged();
+    });
+  }
+  return runningHubScheduler;
+}
+function releaseTaskKeyLeases(taskId) {
+  getRunningHubScheduler().cancel(taskId);
+}
 function resetAllKeyActiveCounts() {
-  localActiveTasksByKey.clear();
-  taskLeaseRegistry.clear();
-  addLog("[RunningHub Key\u6C60] \u5DF2\u5F3A\u5236\u91CD\u7F6E\u6240\u6709\u672C\u5730 Key \u5E76\u53D1\u8BA1\u6570\u4E3A 0");
-  notifyNextKeyWaiter();
-  keyReleaseEventTarget.dispatchEvent(new Event("keyReleased"));
+  getRunningHubScheduler().reset();
 }
 function getLocalActiveCount(apiKey) {
-  if (!apiKey) return 0;
-  return localActiveTasksByKey.get(apiKey) || 0;
+  return getRunningHubScheduler().count(apiKey);
 }
 function getKeyLocalLimit(apiKey) {
   if (!apiKey) return 0;
   const settings3 = extension_settings46[extensionName] || {};
-  const val = settings3.runninghub_key_local_limits?.[apiKey];
+  const ledger = runningHubScheduler?.ledger;
+  const val = ledger?.policy().keys?.[ledger.keyIds.get(apiKey)]?.limit ?? settings3.runninghub_key_local_limits?.[apiKey];
   const num = parseInt(val, 10);
   return isNaN(num) || num <= 0 ? 0 : num;
 }
-function setKeyLocalLimit(apiKey, limit) {
+async function setKeyLocalLimit(apiKey, limit) {
   if (!apiKey) return;
   const settings3 = extension_settings46[extensionName];
   if (!settings3) return;
@@ -43652,6 +43757,8 @@ function setKeyLocalLimit(apiKey, limit) {
     settings3.runninghub_key_local_limits[apiKey] = num;
   }
   saveSettingsDebounced28();
+  await getRunningHubScheduler().ledger.configure({ key: apiKey, limit: Number.isFinite(num) && num > 0 ? num : 0 });
+  getRunningHubScheduler().configurationChanged();
 }
 function parseRunningHubApiKeys(apiKeySetting) {
   if (!apiKeySetting) return [];
@@ -43670,7 +43777,7 @@ function getAllRunningHubApiKeys() {
 }
 async function fetchRunningHubAccountStatus(apiKey) {
   if (!apiKey) throw new Error("API Key \u4E0D\u80FD\u4E3A\u7A7A");
-  const res = await fetch("https://www.runninghub.ai/uc/openapi/accountStatus", {
+  const res = await runningHubFetch("https://www.runninghub.ai/uc/openapi/accountStatus", {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -43679,18 +43786,18 @@ async function fetchRunningHubAccountStatus(apiKey) {
     body: JSON.stringify({
       apikey: apiKey
     })
-  });
+  }, 15000);
   const data = await res.json();
   return data;
 }
 async function fetchRunningHubQueueStatus(apiKey) {
   if (!apiKey) throw new Error("API Key \u4E0D\u80FD\u4E3A\u7A7A");
-  const res = await fetch("https://www.runninghub.ai/openapi/v2/queue/status", {
+  const res = await runningHubFetch("https://www.runninghub.ai/openapi/v2/queue/status", {
     method: "GET",
     headers: {
       "Authorization": `Bearer ${apiKey}`
     }
-  });
+  }, 15000);
   const data = await res.json();
   return data;
 }
@@ -43701,6 +43808,7 @@ async function checkKeyQueueAvailability(apiKey) {
       const limit = Math.max(1, parseInt(data.data.concurrentLimit ?? 1, 10));
       const runningCount = Math.max(0, parseInt(data.data.runningCount ?? 0, 10));
       const queuedCount = Math.max(0, parseInt(data.data.queuedCount ?? 0, 10));
+      if (![limit, runningCount, queuedCount].every(Number.isFinite)) throw new Error("RunningHub 并发状态字段无效");
       const available = limit - runningCount;
       return {
         isValid: true,
@@ -43736,7 +43844,7 @@ async function checkKeyQueueAvailability(apiKey) {
       queuedCount: 0,
       apiKeyType: "UNKNOWN",
       raw: null,
-      errorCode: -1,
+      errorCode: err.status || -1,
       error: err.message || "\u7F51\u7EDC\u8FDE\u63A5\u5F02\u5E38"
     };
   }
@@ -43783,7 +43891,7 @@ async function checkKeyHasBalance(apiKey, forceRefresh = false) {
       hasBalance: false,
       remainCoins: 0,
       remainMoney: 0,
-      errorCode: -1,
+      errorCode: err.status || -1,
       error: err.message || "\u7F51\u7EDC\u8FDE\u63A5\u5F02\u5E38",
       timestamp: now
     };
@@ -43796,224 +43904,8 @@ function invalidateBalanceCache(apiKey) {
     balanceCache.clear();
   }
 }
-function withAcquireLock(fn) {
-  const nextLock = acquireKeyLock.then(async () => {
-    try {
-      return await fn();
-    } catch (e) {
-      throw e;
-    }
-  });
-  acquireKeyLock = nextLock.catch(() => {
-  });
-  return nextLock;
-}
-function notifyNextKeyWaiter() {
-  for (let i = 0; i < fifoKeyWaiters.length; i++) {
-    const waiter = fifoKeyWaiters[i];
-    if (waiter && typeof waiter.resolve === "function") {
-      if (waiter.timer) {
-        clearTimeout(waiter.timer);
-        waiter.timer = null;
-      }
-      const res = waiter.resolve;
-      waiter.resolve = null;
-      res();
-      break;
-    }
-  }
-}
-async function acquireRunningHubKey({
-  apiKeys,
-  abortSignal,
-  taskId,
-  isTaskCancelled,
-  priority = "normal",
-  timeoutMs = 10 * 60 * 1e3
-} = {}) {
-  const keys = apiKeys && apiKeys.length > 0 ? apiKeys : getAllRunningHubApiKeys();
-  if (keys.length === 0) {
-    throw new Error("\u8BF7\u5148\u5728\u8BBE\u7F6E\u4E2D\u586B\u5199\u81F3\u5C11\u4E00\u4E2A\u6709\u6548\u7684 RunningHub API Key");
-  }
-  const startTime = Date.now();
-  const waiterObj = {
-    taskId,
-    priority,
-    resolve: null,
-    timer: null
-  };
-  if (priority === "high") {
-    fifoKeyWaiters.unshift(waiterObj);
-  } else {
-    fifoKeyWaiters.push(waiterObj);
-  }
-  const removeWaiter = () => {
-    if (waiterObj.timer) {
-      clearTimeout(waiterObj.timer);
-      waiterObj.timer = null;
-    }
-    waiterObj.resolve = null;
-    const idx = fifoKeyWaiters.indexOf(waiterObj);
-    if (idx !== -1) {
-      fifoKeyWaiters.splice(idx, 1);
-      notifyNextKeyWaiter();
-    }
-  };
-  if (abortSignal) {
-    abortSignal.addEventListener("abort", removeWaiter, { once: true });
-  }
-  try {
-    while (true) {
-      if (abortSignal?.aborted || typeof isTaskCancelled === "function" && isTaskCancelled()) {
-        removeWaiter();
-        throw new Error("\u4EFB\u52A1\u5DF2\u53D6\u6D88");
-      }
-      if (Date.now() - startTime > timeoutMs) {
-        removeWaiter();
-        throw new Error("\u7B49\u5F85\u53EF\u7528 RunningHub API Key \u8D85\u65F6 (10\u5206\u949F)");
-      }
-      const isHeadOfQueue = fifoKeyWaiters[0] === waiterObj;
-      if (!isHeadOfQueue) {
-        await new Promise((resolve) => {
-          waiterObj.resolve = resolve;
-          waiterObj.timer = setTimeout(() => {
-            waiterObj.resolve = null;
-            resolve();
-          }, 2e3);
-        });
-        continue;
-      }
-      const leaseResult = await withAcquireLock(async () => {
-        if (abortSignal?.aborted || typeof isTaskCancelled === "function" && isTaskCancelled()) {
-          return { cancelled: true };
-        }
-        let busyCount = 0;
-        let zeroBalanceCount = 0;
-        const invalidKeyErrors = [];
-        for (let i = 0; i < keys.length; i++) {
-          const key = keys[i];
-          const maskedKey = key.length > 12 ? `${key.slice(0, 5)}...${key.slice(-4)}` : key;
-          const localLimit = getKeyLocalLimit(key);
-          const currentLocal = getLocalActiveCount(key);
-          if (localLimit > 0 && currentLocal >= localLimit) {
-            busyCount++;
-            addLog(`[RunningHub Key\u6C60] Key #${i + 1} (${maskedKey}) \u5DF2\u8FBE\u672C\u5730\u4E3B\u52A8\u5E76\u53D1\u9650\u5236 (${currentLocal}/${localLimit})\uFF0C\u8DF3\u8FC7`);
-            continue;
-          }
-          const queueInfo = await checkKeyQueueAvailability(key);
-          if (!queueInfo.isValid) {
-            const errText = queueInfo.error || "\u961F\u5217\u72B6\u6001\u67E5\u8BE2\u5931\u8D25";
-            invalidKeyErrors.push({ key, error: errText, code: queueInfo.errorCode });
-            addLog(`[RunningHub Key\u6C60] Key #${i + 1} (${maskedKey}) \u9274\u6743\u6216\u961F\u5217\u72B6\u6001\u5F02\u5E38 (${errText})\uFF0C\u8DF3\u8FC7`);
-            continue;
-          }
-          const effectiveLimit = localLimit > 0 ? Math.min(localLimit, queueInfo.limit) : queueInfo.limit;
-          if (currentLocal >= effectiveLimit) {
-            busyCount++;
-            const limitDesc = localLimit > 0 ? `\u672C\u5730\u9650\u5236: ${localLimit}\u8DEF, \u5B98\u65B9\u4E0A\u9650: ${queueInfo.limit}\u8DEF` : `\u5B98\u65B9\u4E0A\u9650: ${queueInfo.limit}\u8DEF`;
-            addLog(`[RunningHub Key\u6C60] Key #${i + 1} (${maskedKey}) \u5E76\u53D1\u5DF2\u8FBE\u4E0A\u9650 (${currentLocal}/${effectiveLimit}\uFF0C${limitDesc})\uFF0C\u8FDB\u5165\u7B49\u5F85\u6392\u961F`);
-            continue;
-          }
-          if (!queueInfo.isAvailable || queueInfo.available <= currentLocal) {
-            busyCount++;
-            addLog(`[RunningHub Key\u6C60] Key #${i + 1} (${maskedKey}) \u5B98\u65B9\u53EF\u7528\u5E76\u53D1\u4E0D\u8DB3 (\u5B98\u65B9\u8FD0\u884C\u4E2D: ${queueInfo.runningCount}/${queueInfo.limit}, \u672C\u5730\u5728\u9014: ${currentLocal})\uFF0C\u8FDB\u5165\u7B49\u5F85\u6392\u961F`);
-            continue;
-          }
-          const balanceInfo = await checkKeyHasBalance(key);
-          if (!balanceInfo.isValid) {
-            const errText = balanceInfo.error || "\u8D26\u6237\u72B6\u6001\u67E5\u8BE2\u5931\u8D25";
-            invalidKeyErrors.push({ key, error: errText, code: balanceInfo.errorCode });
-            addLog(`[RunningHub Key\u6C60] Key #${i + 1} (${maskedKey}) \u8D26\u6237\u4F59\u989D\u67E5\u8BE2\u5931\u8D25 (${errText})\uFF0C\u8DF3\u8FC7`);
-            continue;
-          }
-          if (!balanceInfo.hasBalance) {
-            zeroBalanceCount++;
-            addLog(`[RunningHub Key\u6C60] Key #${i + 1} (${maskedKey}) \u4F59\u989D\u4E0D\u8DB3\u6216\u5DF2\u7528\u5C3D (RH\u5E01: ${balanceInfo.remainCoins}, \u94B1\u5305: ${balanceInfo.remainMoney})\uFF0C\u8DF3\u8FC7`);
-            continue;
-          }
-          localActiveTasksByKey.set(key, currentLocal + 1);
-          const localLimitText = localLimit > 0 ? `\uFF0C\u672C\u5730\u5E76\u53D1: ${currentLocal + 1}/${localLimit}` : "";
-          addLog(`[RunningHub Key\u6C60] \u6210\u529F\u5206\u914D Key #${i + 1} (${maskedKey})\uFF0C\u5B98\u65B9\u53EF\u7528\u5E76\u53D1: ${queueInfo.available}/${queueInfo.limit}${localLimitText} (\u8FD0\u884C\u4E2D: ${queueInfo.runningCount}\uFF0C\u7C7B\u578B: ${queueInfo.apiKeyType})\uFF0CRH\u5E01: ${balanceInfo.remainCoins}`);
-          removeWaiter();
-          let released = false;
-          const releaseKey = () => {
-            if (!released) {
-              released = true;
-              if (taskId && taskLeaseRegistry.has(taskId)) {
-                const set = taskLeaseRegistry.get(taskId);
-                set.delete(releaseKey);
-                if (set.size === 0) taskLeaseRegistry.delete(taskId);
-              }
-              const cur = localActiveTasksByKey.get(key) || 1;
-              if (cur <= 1) {
-                localActiveTasksByKey.delete(key);
-              } else {
-                localActiveTasksByKey.set(key, cur - 1);
-              }
-              balanceCache.delete(key);
-              addLog(`[RunningHub Key\u6C60] \u4EFB\u52A1\u7ED3\u675F\uFF0C\u91CA\u653E Key #${i + 1} (${maskedKey})\uFF0C\u672C\u5730\u5269\u4F59\u8FD0\u884C: ${localActiveTasksByKey.get(key) || 0}`);
-              notifyNextKeyWaiter();
-              keyReleaseEventTarget.dispatchEvent(new Event("keyReleased"));
-            }
-          };
-          if (taskId) {
-            if (!taskLeaseRegistry.has(taskId)) {
-              taskLeaseRegistry.set(taskId, /* @__PURE__ */ new Set());
-            }
-            taskLeaseRegistry.get(taskId).add(releaseKey);
-          }
-          return {
-            acquired: true,
-            lease: {
-              apiKey: key,
-              releaseKey,
-              remainCoins: balanceInfo.remainCoins,
-              remainMoney: balanceInfo.remainMoney,
-              queueInfo
-            }
-          };
-        }
-        return {
-          acquired: false,
-          busyCount,
-          zeroBalanceCount,
-          invalidKeyErrors
-        };
-      });
-      if (leaseResult.cancelled) {
-        removeWaiter();
-        throw new Error("\u4EFB\u52A1\u5DF2\u53D6\u6D88");
-      }
-      if (leaseResult.acquired) {
-        notifyNextKeyWaiter();
-        return leaseResult.lease;
-      }
-      if (leaseResult.invalidKeyErrors && leaseResult.invalidKeyErrors.length === keys.length) {
-        removeWaiter();
-        const firstErr = leaseResult.invalidKeyErrors[0]?.error || "API Key \u6821\u9A8C\u5931\u8D25";
-        throw new Error(`RunningHub API Key \u9274\u6743\u5931\u8D25 (${firstErr})\uFF0C\u8BF7\u68C0\u67E5\u8BBE\u7F6E\u4E2D\u7684 API Key\uFF01`);
-      }
-      if (leaseResult.busyCount === 0 && (leaseResult.zeroBalanceCount > 0 || leaseResult.invalidKeyErrors && leaseResult.invalidKeyErrors.length > 0)) {
-        removeWaiter();
-        if (leaseResult.zeroBalanceCount > 0) {
-          throw new Error(`\u914D\u7F6E\u7684\u5168\u90E8\u53EF\u7528 RunningHub API Key \u7684 RH\u5E01/\u94B1\u5305\u4F59\u989D\u5747\u5C0F\u4E8E\u7B49\u4E8E0\uFF0C\u8BF7\u5145\u503C\u540E\u91CD\u8BD5\uFF01`);
-        } else {
-          const firstErr = leaseResult.invalidKeyErrors?.[0]?.error || "API Key \u6821\u9A8C\u5931\u8D25";
-          throw new Error(`RunningHub API Key \u9274\u6743\u5931\u8D25 (${firstErr})\uFF0C\u8BF7\u68C0\u67E5\u8BBE\u7F6E\u4E2D\u7684 API Key\uFF01`);
-        }
-      }
-      addLog(`[RunningHub Key\u6C60] \u6240\u6709\u53EF\u7528 Key \u5F53\u524D\u53EF\u7528\u5E76\u53D1\u6EE1\u8F7D (${leaseResult.busyCount || 0} \u4E2A\u6B63\u5728\u8FD0\u884C)\uFF0C\u961F\u9996\u4EFB\u52A1\u8FDB\u5165\u7B49\u5F85\u6392\u961F...`);
-      await new Promise((resolve) => {
-        waiterObj.resolve = resolve;
-        waiterObj.timer = setTimeout(() => {
-          waiterObj.resolve = null;
-          resolve();
-        }, 2e3);
-      });
-    }
-  } finally {
-    removeWaiter();
-  }
+function acquireRunningHubKey(options = {}) {
+  return getRunningHubScheduler().acquire(options);
 }
 async function getUsableRunningHubKeyForUpload() {
   const keys = getAllRunningHubApiKeys();
@@ -44028,7 +43920,7 @@ async function getUsableRunningHubKeyForUpload() {
   }
   return keys[0];
 }
-var balanceCache, BALANCE_CACHE_TTL_MS, keyReleaseEventTarget, localActiveTasksByKey, taskLeaseRegistry, acquireKeyLock, fifoKeyWaiters;
+var runningHubScheduler, balanceCache, BALANCE_CACHE_TTL_MS, keyReleaseEventTarget;
 var init_runninghubKeyManager = __esm({
   "utils/runninghubKeyManager.js"() {
     init_utils();
@@ -44036,10 +43928,6 @@ var init_runninghubKeyManager = __esm({
     balanceCache = /* @__PURE__ */ new Map();
     BALANCE_CACHE_TTL_MS = 30 * 1e3;
     keyReleaseEventTarget = new EventTarget();
-    localActiveTasksByKey = /* @__PURE__ */ new Map();
-    taskLeaseRegistry = /* @__PURE__ */ new Map();
-    acquireKeyLock = Promise.resolve();
-    fifoKeyWaiters = [];
     try {
       if (eventSource20 && typeof eventSource20.on === "function") {
         eventSource20.on("st_chatu8_task_cancelled", (data) => {
@@ -44053,6 +43941,7 @@ var init_runninghubKeyManager = __esm({
     }
     if (typeof window !== "undefined") {
       window.resetRunningHubKeyActiveCounts = resetAllKeyActiveCounts;
+      window.getRunningHubSchedulerStatus = () => getRunningHubScheduler().snapshot();
     }
   }
 });
@@ -47707,6 +47596,10 @@ async function generateRunningHubImage({ prompt: link, width: Xwidth, height: Xh
     type: taskType,
     prompt: link
   });
+  const rhScope = createRunningHubTaskScope(taskId, 900000);
+  const rhFetch = (url, options = {}) => runningHubFetch(url, { ...options, signal: rhScope.signal });
+  try {
+  const settings3 = structuredClone(extension_settings50[extensionName]);
   currentTaskId4 = taskId;
   const startTime = Date.now();
   if (!isPluginToastDisabled()) {
@@ -47744,8 +47637,8 @@ async function generateRunningHubImage({ prompt: link, width: Xwidth, height: Xh
   link = processCharacterPrompt(link);
   link = await stripChineseAnnotations(link);
   change_ = processCharacterPrompt(change_);
+  const rhCharacterNegatives = window.collectedCharacterNegatives || "";
   change_ = await stripChineseAnnotations(change_);
-  const settings3 = extension_settings50[extensionName];
   const rawApiKey = settings3.runninghub_apiKey;
   let workflowCategoryName = "\u4E3B\u5DE5\u4F5C\u6D41";
   let targetWorkerid = settings3.runninghub_workerid;
@@ -47817,8 +47710,8 @@ async function generateRunningHubImage({ prompt: link, width: Xwidth, height: Xh
     insertions
   );
   let negative_prompt = await fumian(_rh_preset.negativePrompt, settings3.UCP_runninghub);
-  if (!Divide_roles && window.collectedCharacterNegatives) {
-    const characterNegatives = window.collectedCharacterNegatives.trim();
+  if (!Divide_roles && rhCharacterNegatives) {
+    const characterNegatives = rhCharacterNegatives.trim();
     if (characterNegatives) {
       negative_prompt = negative_prompt ? `${negative_prompt}, ${characterNegatives}` : characterNegatives;
       addLog(`[\u89D2\u8272\u8D1F\u9762] \u6DFB\u52A0\u89D2\u8272\u8D1F\u9762\u63D0\u793A\u8BCD: ${characterNegatives}`);
@@ -47892,10 +47785,12 @@ async function generateRunningHubImage({ prompt: link, width: Xwidth, height: Xh
       addLog(`[RunningHub] \u6B63\u5728\u4ECE Key \u6C60\u5206\u914D\u7A7A\u95F2\u4E14\u6709\u4F59\u989D\u7684 API Key (\u4F18\u5148\u7EA7: ${isRetry ? "\u9AD8" : "\u666E\u901A"})...`);
       keyLease = await acquireRunningHubKey({
         taskId,
+        abortSignal: rhScope.signal,
         isTaskCancelled: () => !taskQueue.isTaskInQueue(taskId),
         priority: isRetry ? "high" : "normal"
       });
       apiKey = keyLease.apiKey;
+      if (rhScope.signal.aborted || !taskQueue.isTaskInQueue(taskId)) throw new Error("任务已取消");
       taskQueue.updateStatus(taskId, "running");
       const nodeInfoList = extractNodeInfoListFromWorkflow(rawJson, promptObj);
       addLog(`[RunningHub v2] \u63D0\u53D6\u5230 ${nodeInfoList.length} \u4E2A\u8986\u76D6\u53C2\u6570: ${nodeInfoList.map((n) => `${n.nodeId}.${n.fieldName}`).join(", ")}`);
@@ -47914,20 +47809,27 @@ async function generateRunningHubImage({ prompt: link, width: Xwidth, height: Xh
           payload.retainSeconds = retain;
         }
       }
-      const createRes = await fetch(`https://www.runninghub.ai/openapi/v2/run/workflow/${workflowId}`, {
+      keyLease.beginSubmit();
+      const createRes = await rhFetch(`https://www.runninghub.ai/openapi/v2/run/workflow/${workflowId}`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
           "Authorization": `Bearer ${apiKey}`
         },
         body: JSON.stringify(payload)
+      }).catch(error => {
+        if (error.status >= 400 && error.status < 500 && error.status !== 408) keyLease.rejected();
+        throw error;
       });
       const createData = await createRes.json();
       if (createData.taskId) {
         runTaskId = createData.taskId;
+        keyLease.submitted(runTaskId);
         addLog(`[RunningHub v2] \u4EFB\u52A1\u5DF2\u521B\u5EFA\uFF0CID: ${runTaskId}\uFF0C\u8FDB\u5165\u8F6E\u8BE2\u7B49\u5F85...`);
         break;
       }
+      if (!runningHubCreationRejected(createData)) throw new Error("RunningHub 创建响应未包含任务 ID，提交结果待确认，请勿重复生成");
+      keyLease.rejected();
       const errMsg = formatRunningHubApiError({ ...createData, _workflowId: workflowId }, "\u521B\u5EFA RunningHub \u4EFB\u52A1\u5931\u8D25");
       if (/TASK_QUEUE_MAXED/i.test(errMsg) || /queue.*max/i.test(errMsg) || /并发.*满/i.test(errMsg)) {
         addLog(`[RunningHub] \u5B98\u65B9\u63D0\u793A\u961F\u5217\u5DF2\u6EE1 (${errMsg})\uFF0C\u91CA\u653E\u5F53\u524D Key \u5E76\u8F6C\u5165\u961F\u9996\u7B49\u5F85\u4F18\u5148\u91CD\u8BD5...`);
@@ -47952,17 +47854,21 @@ async function generateRunningHubImage({ prompt: link, width: Xwidth, height: Xh
         addLog("\u8F6E\u8BE2\u671F\u95F4\u4EFB\u52A1\u5DF2\u88AB\u53D6\u6D88\u3002");
         throw new Error("\u4EFB\u52A1\u5DF2\u53D6\u6D88");
       }
-      const statRes = await fetch("https://www.runninghub.ai/openapi/v2/query", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "Authorization": `Bearer ${apiKey}`
-        },
-        body: JSON.stringify({ taskId: runTaskId })
-      });
-      const statData = await statRes.json();
-      const status = statData.status;
+      const statData = await runningHubReadWithRetry(async () => {
+        const statRes = await rhFetch("https://www.runninghub.ai/openapi/v2/query", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "Authorization": `Bearer ${apiKey}`
+          },
+          body: JSON.stringify({ taskId: runTaskId })
+        });
+        return await statRes.json();
+      }, { signal: rhScope.signal, onRetry: () => addLog("RunningHub 查询暂时失败，正在重试原任务，不会重新生成") });
+      const status = String(statData.status || "").toUpperCase();
+      if (!["SUCCESS", "FAILED", "CANCEL", "CANCELLED", "CREATE", "QUEUED", "RUNNING"].includes(status)) throw new Error(`RunningHub 状态响应异常: ${statData.errorMessage || statData.msg || status || "缺少状态"}`);
       if (status === "SUCCESS") {
+        keyLease.terminal(statData);
         addLog("[RunningHub v2] \u4EFB\u52A1\u6267\u884C\u6210\u529F\uFF0C\u6B63\u5728\u89E3\u6790\u8F93\u51FA\u7ED3\u679C...");
         if (statData.results && statData.results.length > 0) {
           const mainItem = statData.results[0];
@@ -47978,7 +47884,8 @@ async function generateRunningHubImage({ prompt: link, width: Xwidth, height: Xh
           throw new Error("RunningHub \u4EFB\u52A1\u6210\u529F\u4F46\u672A\u8FD4\u56DE\u4EFB\u4F55\u8F93\u51FA\u6587\u4EF6");
         }
         break;
-      } else if (status === "FAILED") {
+      } else if (["FAILED", "CANCEL", "CANCELLED"].includes(status)) {
+        keyLease.terminal(statData);
         throw new Error(statData.errorMessage || "RunningHub \u4EFB\u52A1\u6267\u884C\u5931\u8D25");
       } else {
         addLog(`[RunningHub v2] \u4EFB\u52A1\u8FD0\u884C\u4E2D (${status || "QUEUED"})...`);
@@ -47989,7 +47896,7 @@ async function generateRunningHubImage({ prompt: link, width: Xwidth, height: Xh
       }
     }
     addLog(`[RunningHub] \u6B63\u5728\u4E0B\u8F7D\u751F\u6210\u7684\u6587\u4EF6...`);
-    const fileRes = await fetch(outputUrl);
+    const fileRes = await runningHubDownload(outputUrl, { signal: rhScope.signal });
     const fileBlob = await fileRes.blob();
     const arrayBuffer = await fileBlob.arrayBuffer();
     let finalImageData = null;
@@ -48027,6 +47934,7 @@ async function generateRunningHubImage({ prompt: link, width: Xwidth, height: Xh
       finalImageData = await convertImageToJpeg(finalImageData);
     }
     const duration = ((Date.now() - startTime) / 1e3).toFixed(1);
+    if (rhScope.signal.aborted || !taskQueue.isTaskInQueue(taskId)) throw new Error("任务已取消");
     taskQueue.completeTask(taskId, true);
     const rhDetailParts = [];
     if (rhTaskCostTime != null) rhDetailParts.push(`RH\u6D88\u8017\u65F6\u95F4: ${rhTaskCostTime}\u79D2`);
@@ -48074,9 +47982,18 @@ async function generateRunningHubImage({ prompt: link, width: Xwidth, height: Xh
       keyLease = null;
     }
   }
+  } catch (error) {
+    if (taskQueue.isTaskInQueue(taskId)) taskQueue.completeTask(taskId, false);
+    throw error;
+  } finally {
+    rhScope.dispose();
+  }
 }
 async function runninghubgenerate(requestData) {
   const { id, prompt: prompt2, width, height, change, negative_prompt: extraNegativePrompt } = requestData;
+  const targetElement = id ? document.querySelector(`[data-request-id="${CSS.escape(String(id))}"]`) : null;
+  const messageId = targetElement?.closest(".mes")?.getAttribute("mesid");
+  const targetValid = captureRunningHubTarget(getContext, messageId != null ? Number(messageId) : undefined);
   addLog(`\u6536\u5230 RunningHub \u751F\u56FE\u8BF7\u6C42 (ID: ${id}) - Prompt: ${prompt2}${change ? ` - Change: ${change}` : ""}`);
   if (change && change.includes("{\u4FEE\u56FE}")) {
     bananaGenerate(requestData);
@@ -48114,6 +48031,9 @@ async function runninghubgenerate(requestData) {
       addLog(`[RunningHub] \u7F13\u5B58\u8BBE\u7F6E\u4E3A\u4E0D\u5B58\u5165\u6570\u636E\u5E93`);
     }
     recordImageGeneration("runninghub", true);
+    if (!targetValid() || targetElement && (!targetElement.isConnected || targetElement.getAttribute("data-request-id") !== String(id))) {
+      throw new Error("原聊天或消息已变化，生成结果已保留在 RunningHub 结果记录中，未插入当前聊天");
+    }
     eventSource23.emit(EventType.GENERATE_IMAGE_RESPONSE, {
       id,
       success: true,
@@ -48147,6 +48067,7 @@ function initializeRunningHubListener() {
   addLog("RunningHub \u751F\u56FE\u4E8B\u4EF6\u76D1\u542C\u5668\u5DF2\u521D\u59CB\u5316\u3002");
 }
 async function replaceWithRunningHub() {
+  if (isPluginEnabled() && extension_settings50[extensionName].mode === "runninghub") getRunningHubScheduler();
   if (isPluginEnabled() && extension_settings50[extensionName].mode === "runninghub") {
     if (!window.initializeRunningHubListener) {
       window.initializeRunningHubListener = true;
@@ -48850,11 +48771,14 @@ async function generateRunningHubRefVideo({ prompt: rawPrompt, width: Xwidth, he
     type: taskType,
     prompt: targetPrompt
   });
+  const rhScope = createRunningHubTaskScope(taskId, 1500000);
+  const rhFetch = (url, options = {}) => runningHubFetch(url, { ...options, signal: rhScope.signal });
+  try {
+  const settings3 = structuredClone(extension_settings51[extensionName]);
   const startTime = Date.now();
   if (!isPluginToastDisabled()) {
     toastr.info(`\u{1F3AC} \u5DF2\u53D1\u8D77 ${taskTypeName} \u8BF7\u6C42...`);
   }
-  const settings3 = extension_settings51[extensionName];
   const rawApiKey = settings3.runninghub_apiKey;
   if (!rawApiKey) {
     taskQueue.completeTask(taskId, false);
@@ -48989,10 +48913,12 @@ async function generateRunningHubRefVideo({ prompt: rawPrompt, width: Xwidth, he
       addLog(`[RunningHubVideo] \u6B63\u5728\u4ECE Key \u6C60\u5206\u914D\u7A7A\u95F2\u4E14\u6709\u4F59\u989D\u7684 API Key (\u4F18\u5148\u7EA7: ${isRetry ? "\u9AD8" : "\u666E\u901A"})...`);
       keyLease = await acquireRunningHubKey({
         taskId,
+        abortSignal: rhScope.signal,
         isTaskCancelled: () => !taskQueue.isTaskInQueue(taskId),
         priority: isRetry ? "high" : "normal"
       });
       apiKey = keyLease.apiKey;
+      if (rhScope.signal.aborted || !taskQueue.isTaskInQueue(taskId)) throw new Error("任务已取消");
       taskQueue.updateStatus(taskId, "running");
       const nodeInfoList = extractNodeInfoListFromWorkflow(targetWorkerJson, promptObj);
       addLog(`[RunningHubRefVideo v2] \u63D0\u53D6\u5230 ${nodeInfoList.length} \u4E2A\u8986\u76D6\u53C2\u6570: ${nodeInfoList.map((n) => `${n.nodeId}.${n.fieldName}`).join(", ")}`);
@@ -49011,20 +48937,27 @@ async function generateRunningHubRefVideo({ prompt: rawPrompt, width: Xwidth, he
           payload.retainSeconds = retain;
         }
       }
-      const createRes = await fetch(`https://www.runninghub.ai/openapi/v2/run/workflow/${targetWorkflowId}`, {
+      keyLease.beginSubmit();
+      const createRes = await rhFetch(`https://www.runninghub.ai/openapi/v2/run/workflow/${targetWorkflowId}`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
           "Authorization": `Bearer ${apiKey}`
         },
         body: JSON.stringify(payload)
+      }).catch(error => {
+        if (error.status >= 400 && error.status < 500 && error.status !== 408) keyLease.rejected();
+        throw error;
       });
       const createData = await createRes.json();
       if (createData.taskId) {
         runTaskId = createData.taskId;
+        keyLease.submitted(runTaskId);
         addLog(`[RunningHubRefVideo v2] \u4EFB\u52A1\u5DF2\u521B\u5EFA\uFF0CID: ${runTaskId}\uFF0C\u8FDB\u5165\u8F6E\u8BE2\u7B49\u5F85...`);
         break;
       }
+      if (!runningHubCreationRejected(createData)) throw new Error("RunningHub 创建响应未包含任务 ID，提交结果待确认，请勿重复生成");
+      keyLease.rejected();
       const errMsg = formatRunningHubApiError({ ...createData, _workflowId: targetWorkflowId }, "\u521B\u5EFA RunningHub \u89C6\u9891\u751F\u6210\u4EFB\u52A1\u5931\u8D25");
       if (/TASK_QUEUE_MAXED/i.test(errMsg) || /queue.*max/i.test(errMsg) || /并发.*满/i.test(errMsg)) {
         addLog(`[RunningHubRefVideo] \u5B98\u65B9\u63D0\u793A\u961F\u5217\u5DF2\u6EE1 (${errMsg})\uFF0C\u91CA\u653E\u5F53\u524D Key \u5E76\u8F6C\u5165\u961F\u9996\u7B49\u5F85\u4F18\u5148\u91CD\u8BD5...`);
@@ -49048,17 +48981,21 @@ async function generateRunningHubRefVideo({ prompt: rawPrompt, width: Xwidth, he
       if (!taskQueue.isTaskInQueue(taskId)) {
         throw new Error("\u4EFB\u52A1\u5DF2\u53D6\u6D88");
       }
-      const statRes = await fetch("https://www.runninghub.ai/openapi/v2/query", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "Authorization": `Bearer ${apiKey}`
-        },
-        body: JSON.stringify({ taskId: runTaskId })
-      });
-      const statData = await statRes.json();
-      const status = statData.status;
+      const statData = await runningHubReadWithRetry(async () => {
+        const statRes = await rhFetch("https://www.runninghub.ai/openapi/v2/query", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "Authorization": `Bearer ${apiKey}`
+          },
+          body: JSON.stringify({ taskId: runTaskId })
+        });
+        return await statRes.json();
+      }, { signal: rhScope.signal, onRetry: () => addLog("RunningHub 查询暂时失败，正在重试原任务，不会重新生成") });
+      const status = String(statData.status || "").toUpperCase();
+      if (!["SUCCESS", "FAILED", "CANCEL", "CANCELLED", "CREATE", "QUEUED", "RUNNING"].includes(status)) throw new Error(`RunningHub 状态响应异常: ${statData.errorMessage || statData.msg || status || "缺少状态"}`);
       if (status === "SUCCESS") {
+        keyLease.terminal(statData);
         addLog("[RunningHubRefVideo v2] \u4EFB\u52A1\u6267\u884C\u6210\u529F\uFF0C\u6B63\u5728\u83B7\u53D6\u8F93\u51FA...");
         if (statData.results && statData.results.length > 0) {
           const mainItem = statData.results[0];
@@ -49074,7 +49011,8 @@ async function generateRunningHubRefVideo({ prompt: rawPrompt, width: Xwidth, he
           throw new Error("RunningHub \u4EFB\u52A1\u6210\u529F\u4F46\u672A\u8FD4\u56DE\u4EFB\u4F55\u8F93\u51FA\u6587\u4EF6");
         }
         break;
-      } else if (status === "FAILED") {
+      } else if (["FAILED", "CANCEL", "CANCELLED"].includes(status)) {
+        keyLease.terminal(statData);
         throw new Error(statData.errorMessage || "RunningHub \u4EFB\u52A1\u6267\u884C\u5931\u8D25");
       } else {
         addLog(`[RunningHubRefVideo v2] \u4EFB\u52A1\u8FD0\u884C\u4E2D (${status || "QUEUED"})...`);
@@ -49085,7 +49023,7 @@ async function generateRunningHubRefVideo({ prompt: rawPrompt, width: Xwidth, he
       }
     }
     addLog(`[RunningHubRefVideo] \u6B63\u5728\u4E0B\u8F7D\u751F\u6210\u7684\u6587\u4EF6...`);
-    const fileRes = await fetch(outputUrl);
+    const fileRes = await runningHubDownload(outputUrl, { signal: rhScope.signal });
     const fileBlob = await fileRes.blob();
     const arrayBuffer = await fileBlob.arrayBuffer();
     let finalMediaData = null;
@@ -49115,6 +49053,7 @@ async function generateRunningHubRefVideo({ prompt: rawPrompt, width: Xwidth, he
       });
     }
     const duration = ((Date.now() - startTime) / 1e3).toFixed(1);
+    if (rhScope.signal.aborted || !taskQueue.isTaskInQueue(taskId)) throw new Error("任务已取消");
     taskQueue.completeTask(taskId, true);
     const rhDetailParts = [];
     if (rhTaskCostTime != null) rhDetailParts.push(`RH\u6D88\u8017\u65F6\u95F4: ${rhTaskCostTime}\u79D2`);
@@ -49160,6 +49099,12 @@ async function generateRunningHubRefVideo({ prompt: rawPrompt, width: Xwidth, he
       keyLease = null;
     }
   }
+  } catch (error) {
+    if (taskQueue.isTaskInQueue(taskId)) taskQueue.completeTask(taskId, false);
+    throw error;
+  } finally {
+    rhScope.dispose();
+  }
 }
 async function executeRunningHubVideoDirectTest({
   prompt: prompt2,
@@ -49173,6 +49118,15 @@ async function executeRunningHubVideoDirectTest({
   onStatusUpdate,
   abortSignal
 }) {
+  const deadlineController = new AbortController();
+  const cancelTest = () => deadlineController.abort(abortSignal?.reason);
+  const parentSignal = abortSignal;
+  if (parentSignal?.aborted) cancelTest();
+  else parentSignal?.addEventListener("abort", cancelTest, { once: true });
+  const deadlineTimer = setTimeout(() => deadlineController.abort(new Error("RunningHub 测试总时限已到")), 1500000);
+  abortSignal = deadlineController.signal;
+  try {
+  const rhFetch = (url, options = {}) => runningHubFetch(url, { ...options, signal: abortSignal });
   const notify = (msg, isError = false) => {
     addLog(`[RunningHubTest] ${msg}`);
     if (typeof onStatusUpdate === "function") {
@@ -49199,7 +49153,7 @@ async function executeRunningHubVideoDirectTest({
         targetPrompt = parsed.promptText;
       }
     }
-    const cleanPrompt = await stripChineseAnnotations(targetPrompt);
+    const cleanPrompt = await runningHubAbortable(stripChineseAnnotations(targetPrompt), abortSignal);
     const { promptObj, seedUsed } = buildRunningHubRefVideoWorkflow(
       workflowJson,
       cleanPrompt,
@@ -49224,7 +49178,8 @@ async function executeRunningHubVideoDirectTest({
         payload.retainSeconds = retain;
       }
     }
-    const createRes = await fetch(`https://www.runninghub.ai/openapi/v2/run/workflow/${workflowId}`, {
+    keyLease.beginSubmit();
+    const createRes = await rhFetch(`https://www.runninghub.ai/openapi/v2/run/workflow/${workflowId}`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -49232,13 +49187,19 @@ async function executeRunningHubVideoDirectTest({
       },
       body: JSON.stringify(payload),
       signal: abortSignal
+    }).catch(error => {
+      if (error.status >= 400 && error.status < 500 && error.status !== 408) keyLease.rejected();
+      throw error;
     });
     const createData = await createRes.json();
     if (!createData.taskId) {
+      if (!runningHubCreationRejected(createData)) throw new Error("RunningHub 创建响应未包含任务 ID，提交结果待确认，请勿重复生成");
+      keyLease.rejected();
       const errDetail = formatRunningHubApiError({ ...createData, _workflowId: workflowId }, "\u521B\u5EFA RunningHub \u751F\u6210\u4EFB\u52A1\u5931\u8D25");
       throw new Error(errDetail);
     }
     const taskId = createData.taskId;
+    keyLease.submitted(taskId);
     notify(`\u4EFB\u52A1\u5DF2\u6210\u529F\u521B\u5EFA (Task ID: ${taskId})\uFF0C\u6B63\u5728\u6392\u961F/\u751F\u6210\u4E2D...`);
     let attempts = 0;
     let outputUrl = null;
@@ -49248,18 +49209,22 @@ async function executeRunningHubVideoDirectTest({
       if (abortSignal?.aborted) throw new Error("\u4EFB\u52A1\u5DF2\u53D6\u6D88");
       await sleep(3e3);
       if (abortSignal?.aborted) throw new Error("\u4EFB\u52A1\u5DF2\u53D6\u6D88");
-      const statRes = await fetch("https://www.runninghub.ai/openapi/v2/query", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "Authorization": `Bearer ${apiKey}`
-        },
-        body: JSON.stringify({ taskId }),
-        signal: abortSignal
-      });
-      const statData = await statRes.json();
-      const status = statData.status;
+      const statData = await runningHubReadWithRetry(async () => {
+        const statRes = await rhFetch("https://www.runninghub.ai/openapi/v2/query", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "Authorization": `Bearer ${apiKey}`
+          },
+          body: JSON.stringify({ taskId }),
+          signal: abortSignal
+        });
+        return await statRes.json();
+      }, { signal: abortSignal, onRetry: () => notify("RunningHub 查询暂时失败，正在重试原任务，不会重新生成") });
+      const status = String(statData.status || "").toUpperCase();
+      if (!["SUCCESS", "FAILED", "CANCEL", "CANCELLED", "CREATE", "QUEUED", "RUNNING"].includes(status)) throw new Error(`RunningHub 状态响应异常: ${statData.errorMessage || statData.msg || status || "缺少状态"}`);
       if (status === "SUCCESS") {
+        keyLease.terminal(statData);
         notify("\u4E91\u7AEF\u751F\u6210\u6210\u529F\uFF01\u6B63\u5728\u83B7\u53D6\u8F93\u51FA\u89C6\u9891\u94FE\u63A5...");
         if (statData.results && statData.results.length > 0) {
           const mainItem = statData.results[0];
@@ -49275,7 +49240,8 @@ async function executeRunningHubVideoDirectTest({
           throw new Error("RunningHub \u4EFB\u52A1\u6210\u529F\u4F46\u672A\u8FD4\u56DE\u4EFB\u4F55\u8F93\u51FA\u6587\u4EF6");
         }
         break;
-      } else if (status === "FAILED") {
+      } else if (["FAILED", "CANCEL", "CANCELLED"].includes(status)) {
+        keyLease.terminal(statData);
         throw new Error(statData.errorMessage || "RunningHub \u4EFB\u52A1\u6267\u884C\u5931\u8D25");
       } else {
         attempts++;
@@ -49285,7 +49251,7 @@ async function executeRunningHubVideoDirectTest({
         throw new Error("\u89C6\u9891\u751F\u6210\u8D85\u65F6 (\u5DF2\u7B49\u5F8515\u5206\u949F)");
       }
     }
-    const fileRes = await fetch(outputUrl, { signal: abortSignal });
+    const fileRes = await runningHubDownload(outputUrl, { signal: abortSignal });
     const fileBlob = await fileRes.blob();
     const arrayBuffer = await fileBlob.arrayBuffer();
     let finalMediaData = null;
@@ -49333,6 +49299,10 @@ async function executeRunningHubVideoDirectTest({
     if (keyLease && typeof keyLease.releaseKey === "function") {
       keyLease.releaseKey();
     }
+  }
+  } finally {
+    clearTimeout(deadlineTimer);
+    parentSignal?.removeEventListener("abort", cancelTest);
   }
 }
 var UPLOAD_CACHE_EXPIRY_MS;
@@ -51427,6 +51397,7 @@ var init_generation = __esm({
           button.setAttribute("data-loading", "true");
           button.textContent = "\u89C6\u9891\u751F\u6210\u4E2D...";
           startGenerating(link);
+          const videoTargetValid = isRh ? captureRunningHubTarget(getContext, Number(button.closest(".mes")?.getAttribute("mesid"))) : () => true;
           const videoPromise = isRh ? Promise.resolve().then(() => (init_runninghubVideo(), runninghubVideo_exports)).then((m) => m.generateRunningHubRefVideo) : Promise.resolve().then(() => (init_comfyuiVideo(), comfyuiVideo_exports)).then((m) => m.generateComfyUIRefVideo);
           videoPromise.then(async (generateFn) => {
             try {
@@ -51450,6 +51421,7 @@ var init_generation = __esm({
                 });
                 addLog(`[${isRh ? "RunningHubRefVideo" : "ComfyUIVideo"}] \u89C6\u9891\u5DF2\u5B58\u5165\u6570\u636E\u5E93 for prompt: ${link}`);
               }
+              if (isRh && (!videoTargetValid() || !button.isConnected || button.getAttribute("data-request-id") !== String(requestId))) throw new Error("原聊天或消息已变化，视频结果已保留在 RunningHub 结果记录中");
               stopGenerating(link);
               const docs2 = [document, ...Array.from(document.querySelectorAll("iframe")).map((f) => f.contentDocument).filter(Boolean)];
               docs2.forEach((doc) => {
@@ -95197,7 +95169,36 @@ function initRunningHubUI(settingsModal) {
       saveSettingsDebounced53();
     });
   }
+  const globalLimitEl = document.getElementById("runninghub_global_local_limit");
+  if (globalLimitEl) {
+    globalLimitEl.value = settings3.runninghub_global_local_limit || "";
+    $(globalLimitEl).off("change.rh_global_limit").on("change.rh_global_limit", async () => {
+      const value = Number(globalLimitEl.value);
+      if (globalLimitEl.value !== "" && (!Number.isSafeInteger(value) || value < 0)) {
+        globalLimitEl.value = settings3.runninghub_global_local_limit || "";
+        toastr.warning("全局并发上限请输入正整数，留空或 0 表示不额外限制");
+        return;
+      }
+      settings3.runninghub_global_local_limit = value || 0;
+      globalLimitEl.value = value || "";
+      saveSettingsDebounced53();
+      try { await getRunningHubScheduler().ledger.configure({ globalLimit: value || 0 }); }
+      catch (error) { toastr.error(error.message); return; }
+      getRunningHubScheduler().configurationChanged();
+    });
+  }
+  const maxQueueEl = document.getElementById("runninghub_max_queue");
+  if (maxQueueEl) {
+    maxQueueEl.value = settings3.runninghub_max_queue ?? 100;
+    $(maxQueueEl).off("change.rh_queue_limit").on("change.rh_queue_limit", () => {
+      const value = Number(maxQueueEl.value);
+      if (!Number.isSafeInteger(value) || value < 1) { maxQueueEl.value = settings3.runninghub_max_queue ?? 100; toastr.warning("等待队列上限请输入正整数"); return; }
+      settings3.runninghub_max_queue = value; saveSettingsDebounced53();
+    });
+  }
   function renderRunningHubKeyConsumptionSummary() {
+    const scheduler = getRunningHubScheduler();
+    renderRunningHubPoolStatus(scheduler.snapshot(), scheduler.waiters.length);
     const $consumptionContainer = $("#runninghub_key_consumption_container");
     if (!$consumptionContainer.length) return;
     const inputEl = document.getElementById("runninghub_apiKey");
@@ -95224,6 +95225,7 @@ function initRunningHubUI(settingsModal) {
       const maskedKey = key.length > 12 ? `${key.slice(0, 6)}...${key.slice(-4)}` : key;
       const stats = getKeyConsumptionStats(key);
       const localLimit = getKeyLocalLimit(key);
+      const keyPaused = Boolean(settings3.runninghub_paused_keys?.[key]);
       html += `
                 <div class="st-chatu8-rh-card">
                     <div style="flex: 1; min-width: 0; width: 100%;">
@@ -95232,6 +95234,7 @@ function initRunningHubUI(settingsModal) {
                                 <i class="fa-solid fa-key" style="color: #10b981;"></i>Key #${idx + 1}: ${maskedKey}
                             </span>
                             <div class="st-chatu8-rh-limit-group">
+                                <label><input type="checkbox" class="rh-key-paused" data-key="${escapeHtml6(key)}" ${keyPaused ? "checked" : ""} /> 暂停新任务</label>
                                 <span class="st-chatu8-rh-limit-label">
                                     <i class="fa-solid fa-gauge-high" style="color: #60a5fa; margin-right: 3px; font-size: 10px;"></i>\u4E3B\u52A8\u5E76\u53D1\u9650\u5236
                                 </span>
@@ -95270,15 +95273,29 @@ function initRunningHubUI(settingsModal) {
     $consumptionContainer.show().html(html);
   }
   renderRunningHubKeyConsumptionSummary();
+  $(document).off("change.rh_key_pause", ".rh-key-paused").on("change.rh_key_pause", ".rh-key-paused", async function() {
+    settings3.runninghub_paused_keys ||= {};
+    settings3.runninghub_paused_keys[$(this).data("key")] = this.checked;
+    saveSettingsDebounced53();
+    try { await getRunningHubScheduler().ledger.configure({ key: $(this).data("key"), paused: this.checked }); }
+    catch (error) { toastr.error(error.message); return; }
+    getRunningHubScheduler().configurationChanged();
+  });
   if (eventSource32 && typeof eventSource32.on === "function") {
     eventSource32.on("rh_consumption_updated", () => {
       renderRunningHubKeyConsumptionSummary();
     });
   }
-  $(document).off("change.rh_local_limit input.rh_local_limit", ".rh-local-limit-input").on("change.rh_local_limit", ".rh-local-limit-input", function() {
+  $(document).off("change.rh_local_limit input.rh_local_limit", ".rh-local-limit-input").on("change.rh_local_limit", ".rh-local-limit-input", async function() {
     const key = $(this).data("key");
     const val = $(this).val();
-    setKeyLocalLimit(key, val);
+    const numericLimit = Number(val);
+    if (val !== "" && (!Number.isSafeInteger(numericLimit) || numericLimit < 0)) {
+      $(this).val(getKeyLocalLimit(key) || "");
+      toastr.warning("单 Key 并发上限请输入正整数，留空或 0 表示跟随平台额度");
+      return;
+    }
+    try { await setKeyLocalLimit(key, val); } catch (error) { toastr.error(error.message); return; }
     const limitNum = parseInt(val, 10);
     $(`.rh-local-limit-input[data-key="${CSS.escape(key)}"]`).val(limitNum > 0 ? limitNum : "");
     if (limitNum > 0) {

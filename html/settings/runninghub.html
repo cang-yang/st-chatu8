@@ -234,6 +234,19 @@
             </div>
             <div id="runninghub_key_status_container" style="margin-top: 10px; display: none;"></div>
             <div id="runninghub_key_consumption_container" style="margin-top: 10px;"></div>
+            <div class="st-chatu8-field-col" style="margin-top: 10px;">
+                <label for="runninghub_global_local_limit">所有 Key 的全局并发上限</label>
+                <input id="runninghub_global_local_limit" type="number" min="0" step="1" class="st-chatu8-input" placeholder="不额外限制" />
+                <label for="runninghub_max_queue">本页最多等待通道的任务数</label>
+                <input id="runninghub_max_queue" type="number" min="1" step="1" class="st-chatu8-input" value="100" />
+                <small>留空或 0：按各 Key 的有效额度调度。每个 Key 的有效额度取平台额度与本地上限的较小值。调低上限不打断已有任务，调高立即补位。此限制由当前页面的 RunningHub 图片、视频及生成测试共用。</small>
+            </div>
+            <div style="margin-top: 10px;">
+                <strong>本地调度状态</strong>
+                <pre id="runninghub_scheduler_status" style="white-space: pre-wrap; font-size: 12px;">暂无本地任务</pre>
+                <div id="runninghub_scheduler_actions"></div>
+                <small>使用 HTTPS 或 localhost 的现代浏览器以启用跨标签页协调。刷新后恢复已提交任务的状态与结果链接，不自动重交排队任务。没有远程任务 ID 时请核对平台记录；取消已提交任务需等待远端确认。</small>
+            </div>
         </div>
         <div class="st-chatu8-field" style="margin-top: 14px;">
             <label for="runninghub_instance_type" style="display: flex; align-items: center; gap: 6px;">
